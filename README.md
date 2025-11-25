@@ -35,3 +35,25 @@ after many "entanglements" with multple deployments and the headache they caused
 ## The Website
 This is a secondary feature to let others use the platform, but I won't worry about it at all until I can verify the builder
 pipeline is working correctly. This is a phase 2 development.
+
+## Testing the full pipeline (local)
+
+You can run a lightweight orchestrator at the repo root to exercise the main pipeline steps (build Rust ingest tool,
+run ingest, run Python app smoke-check, and run an embedder smoke-check).
+
+1. Make the orchestrator executable:
+
+```bash
+chmod +x ./orchestrator.sh ./test_pipeline.sh
+```
+
+2. Run the full pipeline (optional: pass a GitHub repo URL or local zip path as the input):
+
+```bash
+./test_pipeline.sh https://github.com/owner/repo
+```
+
+The orchestrator is intentionally conservative: it will build the Rust tool, attempt ingest if you provide an input,
+try to run `doctown/python/app/main.py` if present, and run a small embedder smoke-check that imports `embedder.py`.
+
+This gives a single entrypoint to extend the pipeline with new steps later.
