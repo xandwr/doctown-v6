@@ -33,9 +33,12 @@ RUN cargo build --release
 # Stage 2: Create the minimal runtime image
 FROM debian:bookworm-slim
 
-# Install runtime dependencies (SSL certificates for HTTPS requests)
+# Install runtime dependencies (SSL certificates, Python 3)
 RUN apt-get update && apt-get install -y \
     ca-certificates \
+    python3 \
+    python3-pip \
+    python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
 # Create a non-root user for security
@@ -45,6 +48,14 @@ WORKDIR /app
 
 # Copy the built binary from the builder stage
 COPY --from=builder /build/target/release/doctown /app/doctown
+
+# Copy Python application
+COPY python /app/python
+
+# Set up Python virtual environment and install dependencies
+RUN python3 -m venv /app/python/venv && \
+    /app/python/venv/bin/pip install --upgrade pip && \
+    /app/python/venv/bin/pip install -r /app/python/requirements.txt
 
 # Change ownership to non-root user
 RUN chown -R doctown:doctown /app

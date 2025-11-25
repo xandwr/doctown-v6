@@ -1,0 +1,49 @@
+{
+  "presets": {
+    "fast": {
+      "model_id": "sentence-transformers/all-MiniLM-L6-v2",
+      "description": "Fast and lightweight, 384 dimensions",
+      "embedding_dim": 384,
+      "recommended_for": "development, testing, quick experiments"
+    },
+    "balanced": {
+      "model_id": "sentence-transformers/all-mpnet-base-v2",
+      "description": "Good balance of speed and quality, 768 dimensions",
+      "embedding_dim": 768,
+      "recommended_for": "production, general purpose"
+    },
+    "quality": {
+      "model_id": "BAAI/bge-large-en-v1.5",
+      "description": "High quality embeddings, 1024 dimensions",
+      "embedding_dim": 1024,
+      "recommended_for": "maximum accuracy, semantic search"
+    },
+    "multilingual": {
+      "model_id": "sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
+      "description": "Supports 50+ languages, 768 dimensions",
+      "embedding_dim": 768,
+      "recommended_for": "multilingual codebases"
+    },
+    "code": {
+      "model_id": "microsoft/codebert-base",
+      "description": "Optimized for code understanding",
+      "embedding_dim": 768,
+      "recommended_for": "code search, semantic code analysis"
+    }
+  },
+  "custom_models": {
+    "examples": [
+      "intfloat/e5-large-v2",
+      "thenlper/gte-large",
+      "BAAI/bge-small-en-v1.5",
+      "sentence-transformers/gtr-t5-large",
+      "any/huggingface/model-id"
+    ],
+    "note": "You can use any model ID from HuggingFace by setting EMBEDDING_MODEL env var or passing model_id parameter"
+  },
+  "usage": {
+    "environment_variable": "export EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2",
+    "preset_usage": "export EMBEDDING_MODEL_PRESET=fast",
+    "direct_code": "embedder = EmbeddingModel(model_id='your-model-id')"
+  }
+}

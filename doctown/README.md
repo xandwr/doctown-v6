@@ -24,3 +24,18 @@ The doctown folder is the entire v6 brain that runs inside a single pod:
 - FastAPI → exposes a clean HTTP endpoint
 
 Everything outside of this folder (website, CLI, etc.) is optional UI layered on top.
+
+## Python Development Setup
+
+The Python embedding service is located in `python/` with its own virtual environment.
+
+**Quick start:**
+```bash
+cd python
+./setup_venv.sh
+source venv/bin/activate
+```
+
+For detailed setup instructions, see [python/SETUP.md](python/SETUP.md).
+
+The Docker build automatically handles the Python environment setup - no manual steps needed for deployment.
