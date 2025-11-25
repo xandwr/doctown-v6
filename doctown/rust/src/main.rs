@@ -32,6 +32,11 @@ struct Args {
     /// Chunk size in characters (default: 240)
     #[arg(long, default_value = "240")]
     chunk_size: usize,
+
+    /// Output directory for JSON files (writes filestructure.json and chunks.json)
+    /// If not specified, outputs to stdout
+    #[arg(short, long)]
+    output_dir: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -108,33 +113,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Output filestructure JSON
-    let json = if args.pretty {
+    let filestructure_json = if args.pretty {
         serde_json::to_string_pretty(&repo_structure)?
     } else {
         serde_json::to_string(&repo_structure)?
     };
 
-    println!("{}", json);
-
-    // If chunking is enabled, also generate chunks.json
-    if args.chunks {
-        eprintln!("\nGenerating chunks...");
+    // Generate chunks if enabled
+    let chunks_json = if args.chunks {
+        eprintln!("Generating chunks...");
         let chunks = extract_chunks(&root_dir, args.chunk_size)?;
         let chunks_output = ChunksOutput {
-            repo_url: args.input,
-            branch: args.branch,
+            repo_url: args.input.clone(),
+            branch: args.branch.clone(),
             total_chunks: chunks.len(),
             chunks,
         };
 
-        let chunks_json = if args.pretty {
+        Some(if args.pretty {
             serde_json::to_string_pretty(&chunks_output)?
         } else {
             serde_json::to_string(&chunks_output)?
-        };
+        })
+    } else {
+        None
+    };
 
-        eprintln!("\n--- CHUNKS OUTPUT ---");
-        println!("{}", chunks_json);
+    // Output to files or stdout
+    if let Some(output_dir) = &args.output_dir {
+        let output_path = Path::new(output_dir);
+        fs::create_dir_all(output_path)?;
+
+        // Write filestructure.json
+        let filestructure_path = output_path.join("filestructure.json");
+        fs::write(&filestructure_path, &filestructure_json)?;
+        eprintln!("Wrote: {}", filestructure_path.display());
+
+        // Write chunks.json if generated
+        if let Some(chunks) = chunks_json {
+            let chunks_path = output_path.join("chunks.json");
+            fs::write(&chunks_path, &chunks)?;
+            eprintln!("Wrote: {}", chunks_path.display());
+        }
+    } else {
+        // Legacy stdout mode
+        println!("{}", filestructure_json);
+        if let Some(chunks) = chunks_json {
+            eprintln!("\n--- CHUNKS OUTPUT ---");
+            println!("{}", chunks);
+        }
     }
 
     // temp_dir is automatically cleaned up when it goes out of scope

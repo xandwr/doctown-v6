@@ -1,9 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Simple orchestrator for the doctown pipeline.
+# =============================================================================
+# Doctown Orchestrator
+# =============================================================================
+# Manages the full Doctown pipeline: Rust ingest + Python embedding + packaging
+#
 # Usage: ./orchestrator.sh <command> [args]
-# Commands: build_rust | ingest | run_python | embed | full
+#
+# Commands:
+#   build_rust              Build the Rust ingest tool
+#   ingest <input>          Run Rust ingest on a GitHub URL or zip path
+#   embed                   Test the embedder with sample texts
+#   build_docpack <input>   Build a complete .docpack from a repository
+#   full [input]            Run the full test pipeline
+#   help                    Show this help
+#
+# =============================================================================
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DOCTOWN_DIR="$ROOT_DIR/doctown"
@@ -11,6 +24,7 @@ RUST_DIR="$DOCTOWN_DIR/rust"
 PY_DIR="$DOCTOWN_DIR/python"
 PY_APP_DIR="$PY_DIR/app"
 PY_VENV="$PY_DIR/venv"
+OUTPUT_DIR="$ROOT_DIR/output"
 
 log() { printf "%s %s\n" "$(date --iso-8601=seconds)" "$*"; }
 err() { log "ERROR:" "$*"; exit 1; }
@@ -132,6 +146,41 @@ PY
   fi
 }
 
+build_docpack() {
+  local input=${1:-}
+  local output_dir=${2:-$OUTPUT_DIR}
+  local branch=${3:-main}
+  local model=${4:-fast}
+  
+  if [ -z "$input" ]; then
+    err "build_docpack requires an <input> arg (GitHub URL or local zip path)"
+  fi
+  
+  log "Building docpack for: $input"
+  log "Output directory: $output_dir"
+  
+  # Ensure environment is ready
+  setup_python_env
+  build_rust
+  
+  local python_cmd=$(get_python_cmd)
+  
+  # Run the CLI
+  (cd "$PY_DIR" && "$python_cmd" -m app.cli build "$input" \
+    --output "$output_dir" \
+    --branch "$branch" \
+    --model "$model")
+  
+  local exit_code=$?
+  if [ $exit_code -eq 0 ]; then
+    log "✓ Docpack build completed successfully"
+    log "Check $output_dir for the .docpack file"
+  else
+    log "✗ Docpack build failed (exit code: $exit_code)"
+    return $exit_code
+  fi
+}
+
 full_pipeline() {
   local input=${1:-}
   log "Starting full pipeline"
@@ -167,12 +216,13 @@ usage() {
 Usage: $0 <command> [args]
 
 Commands:
-  build_rust                 Build the Rust ingest tool (cargo build)
-  ingest <input>             Run the Rust ingest on a GitHub URL or zip path
-  run_python                 Run the Python app (if main.py exists)
-  embed                      Test the embedder with sample texts (auto-setup venv)
-  full [input]               Run the full pipeline: setup -> build -> ingest -> embed
-  help                       Show this help
+  build_rust                        Build the Rust ingest tool (cargo build)
+  ingest <input>                    Run the Rust ingest on a GitHub URL or zip path
+  run_python                        Run the Python app (if main.py exists)
+  embed                             Test the embedder with sample texts
+  build_docpack <input> [out] [br]  Build a .docpack file from a repository
+  full [input]                      Run the full test pipeline
+  help                              Show this help
 
 Environment Variables:
   EMBEDDING_MODEL_PRESET     Model preset: fast, balanced, quality, multilingual, code (default: fast)
@@ -180,11 +230,21 @@ Environment Variables:
   EMBEDDING_DEVICE           Device: cuda, cpu, or auto (default: auto)
 
 Examples:
+  # Build Rust tool only
   $0 build_rust
+  
+  # Run ingest only (outputs JSON)
   $0 ingest https://github.com/owner/repo
+  
+  # Test embedder
   $0 embed
+  
+  # Build a complete .docpack file
+  $0 build_docpack https://github.com/owner/repo
+  $0 build_docpack https://github.com/owner/repo ./docpacks develop
+  
+  # Run full test pipeline
   $0 full https://github.com/owner/repo
-  EMBEDDING_MODEL_PRESET=balanced $0 full https://github.com/owner/repo
 USAGE
 }
 
@@ -199,6 +259,7 @@ case "$cmd" in
   ingest) ingest_repo "$@" ;;
   run_python) run_python "$@" ;;
   embed) embed_texts "$@" ;;
+  build_docpack) build_docpack "$@" ;;
   full) full_pipeline "$@" ;;
   help|--help|-h) usage ;;
   *) err "Unknown command: $cmd" ;;

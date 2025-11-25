@@ -60,3 +60,4 @@ models/*.bin
 models/*.pt
 models/*.onnx
 models/*.safetensors
+/models/*
