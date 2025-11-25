@@ -250,15 +250,20 @@ class CodeIngestor(DomainIngestor):
             # Convert to RawElements
             elements = []
             for chunk in chunks_data.get("chunks", []):
+                # Include symbol_metadata if present
+                attributes = {
+                    "chunk_id": chunk.get("chunk_id"),
+                }
+                if "symbol_metadata" in chunk:
+                    attributes["symbol_metadata"] = chunk["symbol_metadata"]
+                
                 elements.append(RawElement(
                     source_path=chunk["file_path"],
                     element_type="code_chunk",
                     content=chunk["text"],
                     start_offset=chunk.get("start", 0),
                     end_offset=chunk.get("end", 0),
-                    attributes={
-                        "chunk_id": chunk.get("chunk_id"),
-                    }
+                    attributes=attributes,
                 ))
             
             return elements
@@ -306,8 +311,14 @@ class CodeIngestor(DomainIngestor):
             ext = Path(element.source_path).suffix.lower()
             language = element.attributes.get("language") or EXTENSION_TO_LANGUAGE.get(ext)
             
-            # Determine chunk type based on content analysis
-            chunk_type = self._infer_chunk_type(element.content, language)
+            # Check if we have symbol metadata from Rust parser
+            symbol_meta = element.attributes.get("symbol_metadata")
+            
+            # Determine chunk type
+            if symbol_meta and "symbol_kind" in symbol_meta:
+                chunk_type = self._symbol_kind_to_chunk_type(symbol_meta["symbol_kind"])
+            else:
+                chunk_type = self._infer_chunk_type(element.content, language)
             
             chunk_id = element.attributes.get("chunk_id") or UniversalChunk.generate_id(
                 element.source_path,
@@ -315,9 +326,19 @@ class CodeIngestor(DomainIngestor):
                 "code",
             )
             
-            # Count lines for metadata
-            line_start = element.content[:element.start_offset].count("\n") + 1 if element.start_offset > 0 else 1
-            line_count = element.content.count("\n")
+            # Build metadata from symbol info if available, otherwise infer
+            if symbol_meta:
+                metadata = self._build_metadata_from_symbol(symbol_meta, language)
+            else:
+                # Fallback: basic metadata
+                line_start = element.content[:element.start_offset].count("\n") + 1 if element.start_offset > 0 else 1
+                line_count = element.content.count("\n")
+                metadata = ChunkMetadata(
+                    language=language,
+                    line_start=line_start,
+                    line_end=line_start + line_count,
+                    semantic_role=self._infer_semantic_role(element.content, language),
+                )
             
             chunks.append(UniversalChunk(
                 chunk_id=chunk_id,
@@ -325,17 +346,53 @@ class CodeIngestor(DomainIngestor):
                 path=element.source_path,
                 type=chunk_type,
                 text=element.content,
-                metadata=ChunkMetadata(
-                    language=language,
-                    line_start=line_start,
-                    line_end=line_start + line_count,
-                    semantic_role=self._infer_semantic_role(element.content, language),
-                ),
+                metadata=metadata,
                 start_offset=element.start_offset,
                 end_offset=element.end_offset,
             ))
         
         return chunks
+    
+    def _symbol_kind_to_chunk_type(self, symbol_kind: str) -> ChunkType:
+        """Map symbol kind to ChunkType."""
+        mapping = {
+            "function": ChunkType.FUNCTION,
+            "method": ChunkType.FUNCTION,
+            "class": ChunkType.CLASS,
+            "struct": ChunkType.CLASS,
+            "enum": ChunkType.CLASS,
+            "trait": ChunkType.CLASS,
+            "interface": ChunkType.CLASS,
+            "module": ChunkType.MODULE,
+            "const": ChunkType.VARIABLE,
+            "variable": ChunkType.VARIABLE,
+        }
+        return mapping.get(symbol_kind.lower(), ChunkType.TEXT)
+    
+    def _build_metadata_from_symbol(self, symbol_meta: dict, language: str) -> ChunkMetadata:
+        """Build ChunkMetadata from symbol metadata extracted by Rust parser."""
+        # Extract signature info
+        params = None
+        if "signature" in symbol_meta and symbol_meta["signature"]:
+            sig = symbol_meta["signature"]
+            if "parameters" in sig:
+                params = sig["parameters"]
+        
+        return ChunkMetadata(
+            language=language,
+            line_start=symbol_meta.get("line_start"),
+            line_end=symbol_meta.get("line_end"),
+            symbol_name=symbol_meta.get("symbol_name"),
+            qualified_name=symbol_meta.get("qualified_name"),
+            symbol_kind=symbol_meta.get("symbol_kind"),
+            visibility=symbol_meta.get("visibility"),
+            parent_name=symbol_meta.get("parent"),
+            parameters=params,
+            return_type=symbol_meta.get("signature", {}).get("return_type") if "signature" in symbol_meta else None,
+            modifiers=symbol_meta.get("signature", {}).get("modifiers") if "signature" in symbol_meta else None,
+            doc_comment=symbol_meta.get("doc_comment"),
+            semantic_role=symbol_meta.get("symbol_kind"),  # Use symbol_kind as semantic_role
+        )
     
     def _infer_chunk_type(self, content: str, language: Optional[str]) -> ChunkType:
         """

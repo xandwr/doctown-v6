@@ -30,6 +30,9 @@ class PromptTemplate:
         **kwargs,
     ) -> str:
         """Format the user prompt with the given values."""
+        # Build symbol info section if symbol metadata is available
+        symbol_info = self._build_symbol_info(metadata)
+        
         return self.user_template.format(
             text=text,
             path=path,
@@ -37,8 +40,73 @@ class PromptTemplate:
             metadata=metadata,
             context=context,
             language=metadata.get("language", ""),
+            symbol_info=symbol_info,
             **kwargs,
         )
+    
+    def _build_symbol_info(self, metadata: dict[str, Any]) -> str:
+        """Build the symbol information section from metadata."""
+        if not metadata.get("symbol_name"):
+            return ""
+        
+        lines = ["\n=== CODE SYMBOL METADATA ==="]
+        
+        # Basic identification
+        lines.append(f"**Name:** {metadata.get('symbol_name', 'Unknown')}")
+        if metadata.get("qualified_name"):
+            lines.append(f"**Qualified Name:** {metadata['qualified_name']}")
+        if metadata.get("symbol_kind"):
+            lines.append(f"**Kind:** {metadata['symbol_kind']}")
+        if metadata.get("visibility"):
+            lines.append(f"**Visibility:** {metadata['visibility']}")
+        
+        # Location
+        if metadata.get("line_start") and metadata.get("line_end"):
+            lines.append(f"**Location:** Lines {metadata['line_start']}-{metadata['line_end']}")
+        
+        # Signature information
+        if metadata.get("parameters") or metadata.get("return_type"):
+            lines.append("\n**Signature:**")
+            
+            if metadata.get("parameters"):
+                lines.append("Parameters:")
+                for param in metadata["parameters"]:
+                    param_line = f"  - {param['name']}"
+                    if param.get("type_annotation"):
+                        param_line += f": {param['type_annotation']}"
+                    if param.get("default_value"):
+                        param_line += f" = {param['default_value']}"
+                    lines.append(param_line)
+            
+            if metadata.get("return_type"):
+                lines.append(f"Returns: {metadata['return_type']}")
+        
+        # Modifiers and attributes
+        modifiers = []
+        if metadata.get("modifiers"):
+            modifiers.extend(metadata["modifiers"])
+        if metadata.get("decorators"):
+            modifiers.extend(metadata["decorators"])
+        if modifiers:
+            lines.append(f"**Modifiers:** {', '.join(modifiers)}")
+        
+        # Hierarchical context
+        if metadata.get("parent_name"):
+            lines.append(f"**Parent:** {metadata['parent_name']}")
+        
+        # Relationships
+        if metadata.get("implements"):
+            lines.append(f"**Implements:** {', '.join(metadata['implements'])}")
+        if metadata.get("extends"):
+            lines.append(f"**Extends:** {metadata['extends']}")
+        
+        # Existing documentation
+        if metadata.get("doc_comment"):
+            lines.append(f"\n**Existing Doc Comment:**")
+            lines.append(f"```\n{metadata['doc_comment']}\n```")
+        
+        lines.append("=== END SYMBOL METADATA ===\n")
+        return "\n".join(lines)
 
 
 class PromptTemplateRegistry:
@@ -82,14 +150,21 @@ STRUCTURED OUTPUT REQUIREMENTS:
 - Use null for optional fields that don't apply, NOT empty strings
 - Ensure proper JSON syntax (quoted strings, proper escaping, valid arrays/objects)
 
-Documentation Guidelines:
-1. WHAT: Describe what the code does (functionality)
-2. WHY: Explain why it exists (purpose/motivation)  
-3. HOW: Show how to use it (API, parameters, return values)
-4. WHEN: Mention when to use it (use cases, constraints)
-5. RELATIONSHIPS: When semantic context is provided, explain how this code relates to similar code
+SYMBOL METADATA USAGE:
+- When symbol metadata is provided (extracted via static analysis), USE IT but don't repeat it
+- The signature, parameters, types, visibility, and relationships are already known
+- Focus your documentation on BEHAVIOR, PURPOSE, and USAGE - not structure
+- Example: Instead of "This is a public function that takes a string", write "Validates user input against whitelist rules"
 
-Be precise about types, parameters, and return values. Mention edge cases and potential issues.
+Documentation Guidelines:
+1. WHAT: Describe what the code does (high-level functionality and behavior)
+2. WHY: Explain why it exists (purpose, motivation, design decisions)  
+3. HOW: Show how to use it (usage patterns, examples, best practices)
+4. WHEN: Mention when to use it (use cases, constraints, alternatives)
+5. EDGE CASES: Document error conditions, performance considerations, gotchas
+6. RELATIONSHIPS: When semantic context is provided, explain how this code relates to similar code
+
+Be precise about behavior and usage patterns. Mention edge cases and potential issues.
 Use provided semantic relationships to understand implementation patterns and cross-references.
 
 This output is machine-parsed and validated. Malformed JSON or missing required fields will cause failures."""
@@ -100,6 +175,8 @@ CODE_USER_TEMPLATE = """Generate documentation for this code:
 **Language:** {language}
 **Type:** {type}
 
+{symbol_info}
+
 ```{language}
 {text}
 ```
@@ -107,10 +184,13 @@ CODE_USER_TEMPLATE = """Generate documentation for this code:
 {context}
 
 **Analysis Guidelines:**
-- If semantic relationships are provided above, use them to understand how this code fits into the broader system
+- The signature information above has been extracted via static analysis - DO NOT re-describe it
+- Focus on WHAT the code does (high-level behavior), WHY it exists (purpose), and HOW to use it
+- If semantic relationships are provided, use them to understand how this code fits into the broader system
 - Identify patterns, conventions, and architectural relationships
 - Reference related code when explaining functionality
 - Note any implementation similarities or differences with related code
+- Explain error conditions, edge cases, and performance considerations
 
 Respond with JSON:
 {{

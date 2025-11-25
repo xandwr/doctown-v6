@@ -47,6 +47,7 @@ class ChunkType(str, Enum):
     MODULE = "module"
     IMPORT = "import"
     COMMENT = "comment"
+    VARIABLE = "variable"
     
     # Document-specific
     PARAGRAPH = "paragraph"
@@ -105,6 +106,31 @@ class ChunkMetadata:
     semantic_role: Optional[str] = None  # e.g., "constructor", "error_handler", "preamble"
     visibility: Optional[str] = None  # e.g., "public", "private", "internal"
     
+    # Symbol identification (for code symbols)
+    symbol_name: Optional[str] = None  # e.g., "calculate_total"
+    qualified_name: Optional[str] = None  # e.g., "Calculator::calculate_total"
+    symbol_kind: Optional[str] = None  # function, method, class, struct, etc.
+    
+    # Signature information (for functions/methods)
+    parameters: Optional[list[dict[str, Any]]] = None  # [{name, type, default}, ...]
+    return_type: Optional[str] = None
+    type_parameters: Optional[list[str]] = None  # Generic/template params
+    
+    # Modifiers and attributes
+    modifiers: Optional[list[str]] = None  # async, unsafe, static, const
+    decorators: Optional[list[str]] = None  # @property, #[derive(Debug)]
+    annotations: Optional[list[str]] = None  # Type hints, attributes
+    
+    # Relationships
+    implements: Optional[list[str]] = None  # Traits, interfaces
+    extends: Optional[str] = None  # Base class/parent
+    called_by: Optional[list[str]] = None  # Callers (from call graph)
+    calls: Optional[list[str]] = None  # Callees
+    uses_types: Optional[list[str]] = None  # Referenced types
+    
+    # Documentation
+    doc_comment: Optional[str] = None  # Extracted doc comment/docstring
+    
     # Domain-specific extensions (free-form)
     extra: dict[str, Any] = field(default_factory=dict)
     
@@ -127,6 +153,47 @@ class ChunkMetadata:
             result["semantic_role"] = self.semantic_role
         if self.visibility is not None:
             result["visibility"] = self.visibility
+        
+        # Symbol identification
+        if self.symbol_name is not None:
+            result["symbol_name"] = self.symbol_name
+        if self.qualified_name is not None:
+            result["qualified_name"] = self.qualified_name
+        if self.symbol_kind is not None:
+            result["symbol_kind"] = self.symbol_kind
+        
+        # Signature information
+        if self.parameters is not None:
+            result["parameters"] = self.parameters
+        if self.return_type is not None:
+            result["return_type"] = self.return_type
+        if self.type_parameters is not None:
+            result["type_parameters"] = self.type_parameters
+        
+        # Modifiers and attributes
+        if self.modifiers is not None:
+            result["modifiers"] = self.modifiers
+        if self.decorators is not None:
+            result["decorators"] = self.decorators
+        if self.annotations is not None:
+            result["annotations"] = self.annotations
+        
+        # Relationships
+        if self.implements is not None:
+            result["implements"] = self.implements
+        if self.extends is not None:
+            result["extends"] = self.extends
+        if self.called_by is not None:
+            result["called_by"] = self.called_by
+        if self.calls is not None:
+            result["calls"] = self.calls
+        if self.uses_types is not None:
+            result["uses_types"] = self.uses_types
+        
+        # Documentation
+        if self.doc_comment is not None:
+            result["doc_comment"] = self.doc_comment
+        
         if self.extra:
             result["extra"] = self.extra
         return result

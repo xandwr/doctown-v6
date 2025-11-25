@@ -1,6 +1,9 @@
 // the entry point for ingest + later processing
 
+mod parser;
+
 use clap::Parser;
+use parser::{LanguageId, SymbolExtractor};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -55,6 +58,7 @@ enum FileNode {
 struct RepoStructure {
     repo_url: String,
     branch: String,
+    repo_path: String,
     structure: FileNode,
 }
 
@@ -65,6 +69,45 @@ struct Chunk {
     start: usize,
     end: usize,
     text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    symbol_metadata: Option<SymbolMetadata>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct SymbolMetadata {
+    symbol_name: String,
+    qualified_name: String,
+    symbol_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    visibility: Option<String>,
+    line_start: usize,
+    line_end: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signature: Option<SignatureInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    doc_comment: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct SignatureInfo {
+    parameters: Vec<ParameterInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    return_type: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    type_parameters: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    modifiers: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct ParameterInfo {
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    type_annotation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default_value: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -78,12 +121,17 @@ struct ChunksOutput {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    // Create a temporary directory that will be automatically cleaned up
-    let temp_dir = TempDir::new()?;
-    let temp_path = temp_dir.path();
+    // Use output_dir as base if provided, otherwise use temp directory
+    let temp_dir;
+    let base_path = if let Some(ref output_dir) = args.output_dir {
+        Path::new(output_dir)
+    } else {
+        temp_dir = TempDir::new()?;
+        temp_dir.path()
+    };
 
     // Download or copy the zip file
-    let zip_path = temp_path.join("repo.zip");
+    let zip_path = base_path.join("repo.zip");
 
     if args.input.starts_with("http://") || args.input.starts_with("https://") {
         // Convert GitHub URL to zip download URL
@@ -94,8 +142,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         fs::copy(&args.input, &zip_path)?;
     }
 
-    // Extract the zip file
-    let extract_path = temp_path.join("extracted");
+    // Extract the zip file to a subdirectory
+    let extract_path = base_path.join("extracted");
     fs::create_dir_all(&extract_path)?;
     extract_zip(&zip_path, &extract_path)?;
 
@@ -109,6 +157,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let repo_structure = RepoStructure {
         repo_url: args.input.clone(),
         branch: args.branch.clone(),
+        repo_path: root_dir.to_string_lossy().to_string(),
         structure,
     };
 
@@ -294,6 +343,7 @@ fn build_file_structure(path: &Path, name: &str) -> Result<FileNode, Box<dyn std
 }
 
 /// Extract and chunk text content from all files in the repository
+/// Uses symbol-aware chunking for code files, falls back to character chunking for others
 fn extract_chunks(root_dir: &Path, chunk_size: usize) -> Result<Vec<Chunk>, Box<dyn std::error::Error>> {
     let mut all_chunks = Vec::new();
     let mut chunk_counter = 0;
@@ -313,33 +363,122 @@ fn extract_chunks(root_dir: &Path, chunk_size: usize) -> Result<Vec<Chunk>, Box<
             let path_hash = format!("{:x}", hasher.finalize());
             let short_hash = &path_hash[..8];
 
-            // Split content into chunks
-            let chars: Vec<char> = content.chars().collect();
-            let mut start = 0;
+            // Try to detect language from file extension
+            let extension = file_path.extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
+            
+            let chunks = if let Some(lang_id) = LanguageId::from_extension(extension) {
+                // Use symbol-based extraction for code files
+                extract_symbols_from_file(&content, &relative_path, lang_id, &short_hash, &mut chunk_counter)
+            } else {
+                // Fall back to character-based chunking for non-code files
+                extract_text_chunks(&content, &relative_path, chunk_size, &short_hash, &mut chunk_counter)
+            };
 
-            while start < chars.len() {
-                let end = std::cmp::min(start + chunk_size, chars.len());
-                let chunk_text: String = chars[start..end].iter().collect();
-
-                // Generate stable chunk ID
-                let chunk_id = format!("chunk_{}_{:06}", short_hash, chunk_counter);
-                chunk_counter += 1;
-
-                all_chunks.push(Chunk {
-                    chunk_id,
-                    file_path: relative_path.clone(),
-                    start,
-                    end,
-                    text: chunk_text,
-                });
-
-                start = end;
-            }
+            all_chunks.extend(chunks);
         }
     })?;
 
     eprintln!("Extracted {} chunks from repository", all_chunks.len());
     Ok(all_chunks)
+}
+
+/// Extract symbols from a code file using tree-sitter
+fn extract_symbols_from_file(
+    content: &str,
+    file_path: &str,
+    lang_id: LanguageId,
+    _path_hash: &str,
+    counter: &mut usize,
+) -> Vec<Chunk> {
+    let mut chunks = Vec::new();
+    
+    match SymbolExtractor::new(lang_id) {
+        Ok(mut extractor) => {
+            match extractor.extract_symbols(content) {
+                Ok(symbols) => {
+                    for symbol in symbols {
+                        let chunk_id = format!("{}::{}", file_path, symbol.qualified_name);
+                        *counter += 1;
+
+                        // Convert parser::Symbol to SymbolMetadata
+                        let metadata = SymbolMetadata {
+                            symbol_name: symbol.name,
+                            qualified_name: symbol.qualified_name,
+                            symbol_kind: format!("{:?}", symbol.kind).to_lowercase(),
+                            visibility: symbol.visibility.map(|v| format!("{:?}", v).to_lowercase()),
+                            line_start: symbol.line_start,
+                            line_end: symbol.line_end,
+                            signature: symbol.signature.map(|sig| SignatureInfo {
+                                parameters: sig.parameters.into_iter().map(|p| ParameterInfo {
+                                    name: p.name,
+                                    type_annotation: p.type_annotation,
+                                    default_value: p.default_value,
+                                }).collect(),
+                                return_type: sig.return_type,
+                                type_parameters: sig.type_parameters,
+                                modifiers: sig.modifiers,
+                            }),
+                            parent: symbol.parent,
+                            doc_comment: symbol.doc_comment,
+                        };
+
+                        chunks.push(Chunk {
+                            chunk_id,
+                            file_path: file_path.to_string(),
+                            start: symbol.line_start,
+                            end: symbol.line_end,
+                            text: symbol.text,
+                            symbol_metadata: Some(metadata),
+                        });
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Warning: Failed to parse {} as {:?}: {}", file_path, lang_id, e);
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("Warning: Failed to create extractor for {:?}: {}", lang_id, e);
+        }
+    }
+    
+    chunks
+}
+
+/// Fall back to character-based chunking for non-code files
+fn extract_text_chunks(
+    content: &str,
+    file_path: &str,
+    chunk_size: usize,
+    path_hash: &str,
+    counter: &mut usize,
+) -> Vec<Chunk> {
+    let mut chunks = Vec::new();
+    let chars: Vec<char> = content.chars().collect();
+    let mut start = 0;
+
+    while start < chars.len() {
+        let end = std::cmp::min(start + chunk_size, chars.len());
+        let chunk_text: String = chars[start..end].iter().collect();
+
+        let chunk_id = format!("chunk_{}_{:06}", path_hash, counter);
+        *counter += 1;
+
+        chunks.push(Chunk {
+            chunk_id,
+            file_path: file_path.to_string(),
+            start,
+            end,
+            text: chunk_text,
+            symbol_metadata: None,
+        });
+
+        start = end;
+    }
+    
+    chunks
 }
 
 /// Recursively visit all files in a directory
