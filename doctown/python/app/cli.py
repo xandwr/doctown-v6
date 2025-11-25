@@ -32,6 +32,9 @@ import logging
 import sys
 import zipfile
 from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Setup logging before imports
 logging.basicConfig(

@@ -186,26 +186,39 @@ class CodeIngestor(DomainIngestor):
         """
         Extract code elements using the Rust AST parser.
         
-        This writes files to a temp directory and runs the Rust binary.
+        This writes files to a temp directory, creates a zip, and runs the Rust binary.
         """
+        import zipfile
+        
         # Write files to temp directory
         with tempfile.TemporaryDirectory(prefix="doctown_code_") as temp_dir:
             temp_path = Path(temp_dir)
             
+            # Create a directory structure
+            repo_dir = temp_path / "repo"
+            repo_dir.mkdir()
+            
             # Write all files
             for file_path, content in files.items():
-                full_path = temp_path / file_path
+                full_path = repo_dir / file_path
                 full_path.parent.mkdir(parents=True, exist_ok=True)
                 full_path.write_bytes(content)
             
-            # Run Rust ingest
+            # Create a zip file (Rust tool expects a zip)
+            zip_path = temp_path / "repo.zip"
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                for file_path, content in files.items():
+                    # Add with "repo/" prefix to match GitHub zip structure
+                    zipf.writestr(f"repo/{file_path}", content)
+            
+            # Run Rust ingest with the zip file
             output_dir = temp_path / "_output"
             output_dir.mkdir()
             
             rust_dir = self._find_rust_dir()
             cmd = [
                 "cargo", "run", "--quiet", "--",
-                str(temp_path),
+                str(zip_path),  # Pass zip file path, not directory
                 "--chunks",
                 "--chunk-size", str(self.chunk_size),
                 "--output-dir", str(output_dir),

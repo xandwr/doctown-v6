@@ -10,7 +10,7 @@ Architecture:
                  (pluggable)      (fixed schema)   (universal)  (universal)
 """
 from .base import DomainIngestor, UniversalChunk, RawElement, ChunkMetadata
-from .registry import IngestorRegistry, select_ingestor
+from .registry import IngestorRegistry, select_ingestor, get_registry
 from .code import CodeIngestor
 from .generic import GenericTextIngestor
 
@@ -23,6 +23,7 @@ __all__ = [
     # Registry
     "IngestorRegistry",
     "select_ingestor",
+    "get_registry",
     # Built-in ingestors
     "CodeIngestor",
     "GenericTextIngestor",

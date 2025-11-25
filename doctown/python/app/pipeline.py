@@ -228,7 +228,8 @@ class DocumentationPipeline:
     ) -> tuple[dict[str, bytes], dict]:
         """Clone a GitHub repo and load its files."""
         # Use Rust binary to fetch repo (it handles the clone)
-        rust_dir = Path(__file__).parent.parent / "rust"
+        # Path: app/pipeline.py -> app -> python -> doctown -> doctown/rust
+        rust_dir = Path(__file__).parent.parent.parent / "rust"
         output_dir = temp_path / "repo"
         output_dir.mkdir()
         
@@ -512,6 +513,7 @@ class DocumentationPipeline:
         # Show cost estimate
         estimate = generator.estimate_cost(chunks_to_document)
         logger.info(f"  Estimated LLM cost: ${estimate['estimated_cost_usd']:.4f} for {len(chunks_to_document)} chunks")
+        logger.info(f"    Model: {estimate['model']}, ~{estimate['estimated_total_tokens']:,} tokens")
         
         # Generate docs
         def progress(done: int, total: int):
@@ -524,7 +526,12 @@ class DocumentationPipeline:
             progress_callback=progress,
         )
         
-        logger.info(f"  LLM docs: {result.successful} successful, {result.failed} failed, {result.total_tokens} tokens")
+        # Show detailed cost breakdown
+        logger.info(f"  LLM docs: {result.successful} successful, {result.failed} failed")
+        logger.info(f"  Token usage: {result.input_tokens:,} input + {result.output_tokens:,} output = {result.total_tokens:,} total")
+        if result.cached_tokens > 0:
+            logger.info(f"  Cached tokens: {result.cached_tokens:,}")
+        logger.info(f"  💰 Actual cost: ${result.total_cost:.4f}")
         
         return result.to_documentation_json()
     
