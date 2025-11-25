@@ -57,8 +57,9 @@ RUN python3 -m venv /app/python/venv && \
     /app/python/venv/bin/pip install --upgrade pip && \
     /app/python/venv/bin/pip install -r /app/python/requirements.txt
 
-# Change ownership to non-root user
-RUN chown -R doctown:doctown /app
+# Change ownership to non-root user (only what's necessary, skip venv site-packages)
+RUN chown -R doctown:doctown /app/doctown /app/python/app /app/python/config /app/python/scripts && \
+    chown doctown:doctown /app /app/python /app/python/venv/bin/*
 
 # Switch to non-root user
 USER doctown
