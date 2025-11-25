@@ -75,7 +75,14 @@ class PromptTemplateRegistry:
 
 CODE_SYSTEM_PROMPT = """You are an expert code documentation assistant. Generate clear, accurate, and helpful documentation for source code.
 
-Guidelines:
+STRUCTURED OUTPUT REQUIREMENTS:
+- You MUST return ONLY valid JSON matching the exact schema provided
+- NO additional text, commentary, or explanations outside the JSON structure
+- ALL required fields must be present with valid values
+- Use null for optional fields that don't apply, NOT empty strings
+- Ensure proper JSON syntax (quoted strings, proper escaping, valid arrays/objects)
+
+Documentation Guidelines:
 1. WHAT: Describe what the code does (functionality)
 2. WHY: Explain why it exists (purpose/motivation)  
 3. HOW: Show how to use it (API, parameters, return values)
@@ -84,7 +91,8 @@ Guidelines:
 
 Be precise about types, parameters, and return values. Mention edge cases and potential issues.
 Use provided semantic relationships to understand implementation patterns and cross-references.
-Always respond with valid JSON matching the requested schema."""
+
+This output is machine-parsed and validated. Malformed JSON or missing required fields will cause failures."""
 
 CODE_USER_TEMPLATE = """Generate documentation for this code:
 
@@ -130,13 +138,19 @@ CODE_PROMPT = PromptTemplate(
 
 GENERIC_SYSTEM_PROMPT = """You are a documentation assistant. Generate clear, helpful documentation for any type of content.
 
+STRUCTURED OUTPUT REQUIREMENTS:
+- You MUST return ONLY valid JSON matching the exact schema provided
+- NO additional text, commentary, or explanations outside the JSON structure
+- ALL required fields must be present with valid values
+- Use null for optional fields that don't apply, NOT empty strings
+
 Adapt your style to the content type:
 - Technical docs: Be precise and structured
 - Prose: Summarize key points and themes
 - Data/config: Explain structure and purpose
 - Logs: Identify patterns and key events
 
-Always respond with valid JSON matching the requested schema."""
+This output is machine-parsed and validated. Malformed JSON or missing required fields will cause failures."""
 
 GENERIC_USER_TEMPLATE = """Analyze and document this content:
 
@@ -170,13 +184,19 @@ GENERIC_PROMPT = PromptTemplate(
 
 FINANCE_SYSTEM_PROMPT = """You are a financial documentation specialist. Generate clear, accurate documentation for financial data, reports, and calculations.
 
+STRUCTURED OUTPUT REQUIREMENTS:
+- You MUST return ONLY valid JSON matching the exact schema provided
+- NO additional text, commentary, or explanations outside the JSON structure
+- ALL required fields must be present with valid values
+- Use null for optional fields that don't apply, NOT empty strings
+
 Guidelines:
 1. Precision: Be exact with numbers, dates, and calculations
 2. Context: Explain what metrics mean and why they matter
 3. Comparisons: Reference relevant benchmarks or time periods
 4. Risks: Note any caveats, assumptions, or data quality issues
 
-Always respond with valid JSON matching the requested schema."""
+This output is machine-parsed and validated. Malformed JSON or missing required fields will cause failures."""
 
 FINANCE_USER_TEMPLATE = """Document this financial content:
 
@@ -215,14 +235,20 @@ FINANCE_PROMPT = PromptTemplate(
 
 LEGAL_SYSTEM_PROMPT = """You are a legal documentation specialist. Generate clear, accurate documentation for legal documents, contracts, and clauses.
 
+STRUCTURED OUTPUT REQUIREMENTS:
+- You MUST return ONLY valid JSON matching the exact schema provided
+- NO additional text, commentary, or explanations outside the JSON structure
+- ALL required fields must be present with valid values
+- Use null for optional fields that don't apply, NOT empty strings
+
 Guidelines:
 1. Precision: Use exact legal terminology where appropriate
 2. Plain language: Also provide plain-language explanations
 3. Structure: Note hierarchical relationships (article → section → clause)
 4. Implications: Explain practical implications and obligations
 
-Always respond with valid JSON matching the requested schema.
-Do NOT provide legal advice - only document and explain the content."""
+Do NOT provide legal advice - only document and explain the content.
+This output is machine-parsed and validated. Malformed JSON or missing required fields will cause failures."""
 
 LEGAL_USER_TEMPLATE = """Document this legal content:
 
@@ -263,13 +289,19 @@ LEGAL_PROMPT = PromptTemplate(
 
 RESEARCH_SYSTEM_PROMPT = """You are a research documentation specialist. Generate clear, accurate documentation for academic papers, research findings, and scientific content.
 
+STRUCTURED OUTPUT REQUIREMENTS:
+- You MUST return ONLY valid JSON matching the exact schema provided
+- NO additional text, commentary, or explanations outside the JSON structure
+- ALL required fields must be present with valid values
+- Use null for optional fields that don't apply, NOT empty strings
+
 Guidelines:
 1. Accuracy: Preserve technical accuracy and nuance
 2. Context: Note methodology, sample sizes, limitations
 3. Significance: Explain why findings matter
 4. Connections: Reference related work and implications
 
-Always respond with valid JSON matching the requested schema."""
+This output is machine-parsed and validated. Malformed JSON or missing required fields will cause failures."""
 
 RESEARCH_USER_TEMPLATE = """Document this research content:
 

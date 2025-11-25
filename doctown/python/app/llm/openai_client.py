@@ -185,6 +185,60 @@ class ResearchDocumentation(BaseModel):
     notes: Optional[list[str]] = Field(default=None, description="Important observations")
 
 
+# =============================================================================
+# BATCH MODE SCHEMAS - Strict structured output for multiple symbols
+# =============================================================================
+
+class BatchSymbolRequest(BaseModel):
+    """A single symbol in a batch request."""
+    symbol_id: str = Field(description="Unique identifier for this symbol (chunk_id)")
+    path: str = Field(description="File path")
+    type: str = Field(description="Symbol type (function, class, etc)")
+    language: str = Field(description="Programming language")
+    text: str = Field(description="Symbol source code or content")
+    context: Optional[str] = Field(default=None, description="Semantic context (related symbols)")
+
+
+class BatchSymbolResponse(BaseModel):
+    """Documentation response for a single symbol in batch mode."""
+    symbol_id: str = Field(description="Must match the symbol_id from the request")
+    summary: str = Field(description="One-line description")
+    description: str = Field(description="Detailed explanation")
+    parameters: Optional[list[Parameter]] = Field(default=None, description="Function/method parameters (code domain)")
+    returns: Optional[ReturnValue] = Field(default=None, description="Return value description (code domain)")
+    examples: Optional[list[str]] = Field(default=None, description="Example usage code")
+    notes: Optional[list[str]] = Field(default=None, description="Edge cases, warnings, considerations")
+    see_also: Optional[list[str]] = Field(default=None, description="Related functions/classes/files")
+    key_topics: Optional[list[str]] = Field(default=None, description="Main topics (generic domain)")
+    financial_concepts: Optional[list[str]] = Field(default=None, description="Financial concepts (finance domain)")
+    metrics: Optional[list[str]] = Field(default=None, description="Financial metrics (finance domain)")
+    legal_concepts: Optional[list[str]] = Field(default=None, description="Legal concepts (legal domain)")
+    obligations: Optional[list[str]] = Field(default=None, description="Obligations (legal domain)")
+    key_findings: Optional[list[str]] = Field(default=None, description="Research findings (research domain)")
+    methodology: Optional[str] = Field(default=None, description="Research methodology (research domain)")
+
+
+class BatchDocumentationResponse(BaseModel):
+    """Structured output for batch documentation generation.
+    
+    CRITICAL: This array MUST contain exactly one entry for each symbol in the request.
+    Every symbol_id from the request MUST appear in this response.
+    """
+    symbols: list[BatchSymbolResponse] = Field(
+        description="Array of documentation for each requested symbol. MUST match all requested symbol_ids."
+    )
+    
+    def validate_completeness(self, requested_ids: list[str]) -> tuple[bool, list[str]]:
+        """Validate that all requested symbols are documented.
+        
+        Returns:
+            (is_complete, missing_ids)
+        """
+        response_ids = {s.symbol_id for s in self.symbols}
+        missing = [sid for sid in requested_ids if sid not in response_ids]
+        return len(missing) == 0, missing
+
+
 def get_model_for_domain(domain: Domain) -> type[BaseModel]:
     """Get the appropriate Pydantic model for a domain."""
     domain_models = {
@@ -822,12 +876,15 @@ class OpenAIDocGenerator:
         progress_callback: Optional[Callable[[int, int], None]] = None,
     ) -> BatchDocumentationResult:
         """
-        Generate documentation in batch mode (multiple symbols per request).
+        Generate documentation in batch mode with STRICT structured output.
         
-        This is more efficient for:
-        - Reducing network latency (fewer requests)
-        - Better context utilization with larger models
-        - Cross-symbol analysis and consistency
+        Uses OpenAI structured outputs API to ensure:
+        - No missing symbols
+        - No batch loss
+        - No partial responses
+        - No alignment errors
+        - Fully machine-verifiable
+        - Perfect LLM determinism
         
         Args:
             chunks: List of chunks to document
@@ -856,45 +913,75 @@ class OpenAIDocGenerator:
         completed = 0
         for batch_idx, batch in enumerate(batches):
             try:
-                # Build batch prompt
-                # Assume all chunks in batch have the same domain (typical case)
+                # Build structured input
                 domain = batch[0].domain
                 prompt_template = get_prompt_for_domain(domain)
                 
-                # Build a combined prompt for all symbols in the batch
-                system_prompt = (prompt_template.system_prompt +
-                    "\n\nYou are processing MULTIPLE symbols at once. " +
-                    "Generate documentation for each symbol in a JSON array format.")
+                # Build system prompt emphasizing structured output
+                system_prompt = f"""{prompt_template.system_prompt}
+
+CRITICAL BATCH MODE INSTRUCTIONS:
+You must ONLY return a JSON object matching this EXACT schema:
+{{
+  "symbols": [
+    {{
+      "symbol_id": "<exact symbol_id from input>",
+      "summary": "one-line description",
+      "description": "detailed explanation",
+      ... additional fields as appropriate ...
+    }}
+  ]
+}}
+
+REQUIREMENTS:
+1. The "symbols" array MUST contain EXACTLY {len(batch)} entries
+2. Each entry MUST have the EXACT symbol_id from the request
+3. ALL {len(batch)} symbols MUST be documented - NO EXCEPTIONS
+4. NO missing symbols, NO skipped entries, NO partial responses
+5. Follow the schema precisely - this is machine-parsed
+
+Your response will be automatically validated. Missing or mismatched symbol_ids will cause failure."""
                 
-                user_parts = ["Generate documentation for the following symbols:\n"]
-                
-                for idx, chunk in enumerate(batch, 1):
+                # Build user prompt with symbol details as structured data
+                symbols_data = []
+                for chunk in batch:
                     context = context_map.get(chunk.chunk_id, "")
-                    user_parts.append(f"\n{'='*60}")
-                    user_parts.append(f"SYMBOL {idx}/{len(batch)}: {chunk.chunk_id}")
-                    user_parts.append(f"{'='*60}\n")
-                    user_parts.append(f"**File:** {chunk.path}")
-                    user_parts.append(f"**Type:** {chunk.type.value if hasattr(chunk.type, 'value') else str(chunk.type)}")
+                    symbol_info = {
+                        "symbol_id": chunk.chunk_id,
+                        "path": chunk.path,
+                        "type": chunk.type.value if hasattr(chunk.type, 'value') else str(chunk.type),
+                        "language": chunk.metadata.language or "",
+                        "text": chunk.text,
+                    }
                     if context:
-                        user_parts.append(f"\n{context}\n")
-                    user_parts.append(f"\n```{chunk.metadata.language or ''}")
-                    user_parts.append(chunk.text)
-                    user_parts.append("```\n")
+                        symbol_info["context"] = context
+                    symbols_data.append(symbol_info)
                 
-                user_parts.append(f"\n{'='*60}\n")
-                user_parts.append("Respond with a JSON array containing documentation for each symbol:")
-                user_parts.append("[")
-                user_parts.append('  {"chunk_id": "...", "summary": "...", "description": "...", ...},')
-                user_parts.append('  {"chunk_id": "...", "summary": "...", "description": "...", ...}')
-                user_parts.append("]")
+                # Format as clear, structured user message
+                user_content = f"""Generate documentation for these {len(batch)} symbols:
+
+SYMBOLS TO DOCUMENT:
+"""
+                for idx, symbol in enumerate(symbols_data, 1):
+                    user_content += f"\n{'='*70}\n"
+                    user_content += f"SYMBOL {idx}/{len(batch)}\n"
+                    user_content += f"{'='*70}\n"
+                    user_content += f"symbol_id: {symbol['symbol_id']}\n"
+                    user_content += f"path: {symbol['path']}\n"
+                    user_content += f"type: {symbol['type']}\n"
+                    user_content += f"language: {symbol['language']}\n"
+                    if symbol.get('context'):
+                        user_content += f"\n{symbol['context']}\n"
+                    user_content += f"\n```{symbol['language']}\n{symbol['text']}\n```\n"
                 
-                user_content = "\n".join(user_parts)
+                user_content += f"\n{'='*70}\n"
+                user_content += f"REQUIRED: Document ALL {len(batch)} symbols above in the structured JSON format.\n"
+                user_content += f"Symbol IDs to include: {[s['symbol_id'] for s in symbols_data]}\n"
                 
-                # Make API call without structured outputs (use JSON mode instead)
-                # Cap max_completion_tokens at 16384 for gpt-4o/gpt-4o-mini
+                # Make API call with structured outputs
                 batch_max_tokens = min(self.max_completion_tokens * len(batch), 16384)
                 
-                response = await self._async_client.chat.completions.create(
+                response = await self._async_client.beta.chat.completions.parse(
                     model=self.model,
                     messages=[
                         {"role": "system", "content": system_prompt},
@@ -902,11 +989,11 @@ class OpenAIDocGenerator:
                     ],
                     max_completion_tokens=batch_max_tokens,
                     temperature=self.temperature,
-                    response_format={"type": "json_object"},
+                    response_format=BatchDocumentationResponse,
                 )
                 
-                # Parse response
-                content = response.choices[0].message.content
+                # Get parsed structured response
+                parsed_response: Optional[BatchDocumentationResponse] = response.choices[0].message.parsed
                 
                 # Extract token usage
                 if response.usage:
@@ -920,59 +1007,114 @@ class OpenAIDocGenerator:
                     batch_cached_tokens = 0
                     batch_total_tokens = 0
                 
-                # Parse JSON array
-                try:
-                    docs_array = json.loads(content)
-                    
-                    # Handle both array and object with results key
-                    if isinstance(docs_array, dict):
-                        docs_array = docs_array.get("results", docs_array.get("symbols", [docs_array]))
-                    
-                    # Map docs back to chunks
-                    docs_by_id = {doc.get("chunk_id", doc.get("symbol_id", "")): doc for doc in docs_array}
-                    
-                    for chunk in batch:
-                        doc = docs_by_id.get(chunk.chunk_id, {})
-                        
-                        if doc:
-                            result = DocumentationResult(
-                                chunk_id=chunk.chunk_id,
-                                success=True,
-                                documentation=doc,
-                                tokens_used=batch_total_tokens // len(batch),  # Distribute tokens evenly
-                            )
-                            result._input_tokens = batch_input_tokens // len(batch)
-                            result._output_tokens = batch_output_tokens // len(batch)
-                            result._cached_tokens = batch_cached_tokens // len(batch)
-                        else:
-                            result = DocumentationResult(
-                                chunk_id=chunk.chunk_id,
-                                success=False,
-                                error="Symbol not found in batch response",
-                            )
-                        
-                        batch_result.add(
-                            result,
-                            result._input_tokens,
-                            result._output_tokens,
-                            result._cached_tokens,
-                        )
-                
-                except json.JSONDecodeError as e:
-                    logger.error(f"Failed to parse batch response: {e}")
-                    logger.debug(f"Response content: {content[:500]}")
-                    
-                    # Mark all chunks in batch as failed
+                # Validate structured response
+                if parsed_response is None:
+                    logger.error(f"Batch {batch_idx + 1}: Failed to parse structured output")
+                    # Mark all chunks as failed
                     for chunk in batch:
                         result = DocumentationResult(
                             chunk_id=chunk.chunk_id,
                             success=False,
-                            error=f"JSON parse error: {e}",
+                            error="Failed to parse structured output from LLM",
                         )
                         batch_result.add(result, 0, 0, 0)
+                    continue
+                
+                # Validate completeness
+                requested_ids = [chunk.chunk_id for chunk in batch]
+                is_complete, missing_ids = parsed_response.validate_completeness(requested_ids)
+                
+                if not is_complete:
+                    logger.warning(f"Batch {batch_idx + 1}: Missing {len(missing_ids)} symbols: {missing_ids[:5]}")
+                
+                # Map responses back to chunks
+                docs_by_id = {doc.symbol_id: doc for doc in parsed_response.symbols}
+                
+                for chunk in batch:
+                    doc = docs_by_id.get(chunk.chunk_id)
+                    
+                    if doc:
+                        # Convert Pydantic model to dict
+                        doc_dict = doc.model_dump(exclude_none=True, exclude={'symbol_id'})
+                        
+                        result = DocumentationResult(
+                            chunk_id=chunk.chunk_id,
+                            success=True,
+                            documentation=doc_dict,
+                            tokens_used=batch_total_tokens // len(batch),
+                        )
+                        result._input_tokens = batch_input_tokens // len(batch)
+                        result._output_tokens = batch_output_tokens // len(batch)
+                        result._cached_tokens = batch_cached_tokens // len(batch)
+                    else:
+                        # Symbol missing from response
+                        result = DocumentationResult(
+                            chunk_id=chunk.chunk_id,
+                            success=False,
+                            error=f"Symbol {chunk.chunk_id} not found in batch response",
+                        )
+                    
+                    batch_result.add(
+                        result,
+                        result._input_tokens if result.success else 0,
+                        result._output_tokens if result.success else 0,
+                        result._cached_tokens if result.success else 0,
+                    )
+                
+                # Log validation results
+                success_count = sum(1 for chunk in batch if docs_by_id.get(chunk.chunk_id))
+                logger.info(f"  Batch {batch_idx + 1}/{len(batches)}: "
+                          f"{success_count}/{len(batch)} symbols documented")
+                
+                # Retry missing symbols individually if we have failures
+                if not is_complete and missing_ids:
+                    logger.info(f"  Retrying {len(missing_ids)} missing symbols individually...")
+                    missing_chunks = [chunk for chunk in batch if chunk.chunk_id in missing_ids]
+                    
+                    for chunk in missing_chunks:
+                        try:
+                            # Use per-symbol API with structured output
+                            context = context_map.get(chunk.chunk_id, "")
+                            retry_result = await self.generate_for_chunk_async(
+                                chunk,
+                                context=context,
+                                retry_with_truncation=False,
+                            )
+                            
+                            # Update the result in batch_result
+                            # Find and replace the failed result
+                            for i, existing_result in enumerate(batch_result.results):
+                                if existing_result.chunk_id == chunk.chunk_id:
+                                    # Remove old failed result stats
+                                    if not existing_result.success:
+                                        batch_result.failed -= 1
+                                    else:
+                                        batch_result.successful -= 1
+                                        batch_result.total_tokens -= existing_result.tokens_used
+                                        batch_result.input_tokens -= getattr(existing_result, '_input_tokens', 0)
+                                        batch_result.output_tokens -= getattr(existing_result, '_output_tokens', 0)
+                                        batch_result.cached_tokens -= getattr(existing_result, '_cached_tokens', 0)
+                                    
+                                    # Replace with new result
+                                    batch_result.results[i] = retry_result
+                                    
+                                    # Add new result stats
+                                    if retry_result.success:
+                                        batch_result.successful += 1
+                                        batch_result.total_tokens += retry_result.tokens_used
+                                        batch_result.input_tokens += getattr(retry_result, '_input_tokens', 0)
+                                        batch_result.output_tokens += getattr(retry_result, '_output_tokens', 0)
+                                        batch_result.cached_tokens += getattr(retry_result, '_cached_tokens', 0)
+                                    else:
+                                        batch_result.failed += 1
+                                    break
+                        
+                        except Exception as retry_error:
+                            logger.error(f"  Retry failed for {chunk.chunk_id}: {retry_error}")
                 
             except Exception as e:
                 logger.error(f"Error processing batch {batch_idx + 1}: {e}")
+                logger.exception(e)
                 
                 # Mark all chunks in batch as failed
                 for chunk in batch:
