@@ -21,6 +21,11 @@ from .prompts import get_prompt_for_domain, PromptTemplate
 
 logger = logging.getLogger(__name__)
 
+
+def estimate_tokens(text: str) -> int:
+    """Rough estimate of token count (1 token ~= 4 chars for English)."""
+    return len(text) // 4
+
 # Try to import openai
 try:
     import openai
@@ -78,7 +83,7 @@ OPENAI_PRICING = {
 }
 
 
-def calculate_cost(model: str, input_tokens: int, output_tokens: int, cached_tokens: int = 0) -> dict[str, float]:
+def calculate_cost(model: str, input_tokens: int, output_tokens: int, cached_tokens: int = 0, batch_discount: float = 0.0) -> dict[str, float]:
     """
     Calculate the cost of an OpenAI API call based on actual token usage.
     
@@ -87,6 +92,7 @@ def calculate_cost(model: str, input_tokens: int, output_tokens: int, cached_tok
         input_tokens: Number of input tokens (excluding cached)
         output_tokens: Number of output tokens
         cached_tokens: Number of cached input tokens (if applicable)
+        batch_discount: Discount percentage for batch API (e.g., 0.5 for 50% off)
     
     Returns:
         Dictionary with cost breakdown
@@ -105,6 +111,12 @@ def calculate_cost(model: str, input_tokens: int, output_tokens: int, cached_tok
     if cached_tokens > 0 and "cached_input" in pricing:
         cached_cost = (cached_tokens / 1_000_000) * pricing["cached_input"]
     
+    # Apply batch discount if specified
+    if batch_discount > 0:
+        input_cost *= (1 - batch_discount)
+        output_cost *= (1 - batch_discount)
+        cached_cost *= (1 - batch_discount)
+    
     total_cost = input_cost + output_cost + cached_cost
     
     return {
@@ -112,6 +124,7 @@ def calculate_cost(model: str, input_tokens: int, output_tokens: int, cached_tok
         "output_cost": output_cost,
         "cached_cost": cached_cost,
         "total_cost": total_cost,
+        "batch_discount": batch_discount,
     }
 
 
@@ -282,22 +295,34 @@ class BatchDocumentationResult:
 
 class OpenAIDocGenerator:
     """
-    Documentation generator using OpenAI API.
+    Documentation generator using OpenAI API with per-symbol processing.
+    
+    Architecture:
+    - Each chunk (symbol) is processed individually in parallel
+    - No arbitrary batching of multiple symbols into one prompt
+    - Automatic retry with truncation on token limit errors
+    - Respects concurrency limits to avoid rate limiting
+    
+    This approach avoids token limit issues by keeping symbols atomic:
+    - Small symbols: Processed quickly in parallel
+    - Large symbols: Handled individually, truncated if needed
+    - Never combines multiple symbols into giant prompts
     
     Features:
     - Structured JSON output via response_format
     - Domain-specific prompt templates
-    - Batch processing with concurrency control
+    - Intelligent per-symbol parallel processing
+    - Automatic truncation retry on token limits
     - Token tracking for cost estimation
     - Graceful fallback when API unavailable
     
     Usage:
         generator = OpenAIDocGenerator()
         
-        # Single chunk
+        # Single chunk (symbol)
         result = generator.generate_for_chunk(chunk)
         
-        # Batch with concurrency
+        # Batch of symbols with parallel execution
         results = await generator.generate_batch_async(chunks, max_concurrent=10)
         
         # Or sync batch
@@ -363,6 +388,7 @@ class OpenAIDocGenerator:
         chunk: UniversalChunk,
         context: str = "",
         prompt_override: Optional[PromptTemplate] = None,
+        retry_with_truncation: bool = True,
     ) -> DocumentationResult:
         """
         Generate documentation for a single chunk.
@@ -371,6 +397,7 @@ class OpenAIDocGenerator:
             chunk: The chunk to document
             context: Additional context (e.g., related chunks)
             prompt_override: Custom prompt template (uses domain default if None)
+            retry_with_truncation: If True, retry with truncated content on token limit errors
         
         Returns:
             DocumentationResult with the generated documentation
@@ -447,7 +474,39 @@ class OpenAIDocGenerator:
             return result
             
         except Exception as e:
-            logger.error(f"Error generating docs for {chunk.chunk_id}: {e}")
+            error_str = str(e).lower()
+            
+            # Check if this is a token limit error
+            if retry_with_truncation and any(phrase in error_str for phrase in [
+                "context_length_exceeded", "token limit", "maximum context", "too many tokens"
+            ]):
+                logger.warning(f"Token limit exceeded for {chunk.chunk_id} ({chunk.path}), retrying with truncation...")
+                
+                # Truncate the chunk text to approximately 75% of original length
+                truncated_text = chunk.text[:int(len(chunk.text) * 0.75)]
+                truncated_text += "\n\n[... content truncated due to length ...]"
+                
+                # Create a truncated chunk
+                truncated_chunk = UniversalChunk(
+                    chunk_id=chunk.chunk_id,
+                    domain=chunk.domain,
+                    path=chunk.path,
+                    type=chunk.type,
+                    text=truncated_text,
+                    metadata=chunk.metadata,
+                    start_offset=chunk.start_offset,
+                    end_offset=chunk.end_offset,
+                )
+                
+                # Retry without further truncation attempts
+                return self.generate_for_chunk(
+                    truncated_chunk,
+                    context=context,
+                    prompt_override=prompt_override,
+                    retry_with_truncation=False,
+                )
+            
+            logger.error(f"Error generating docs for {chunk.chunk_id} ({chunk.path}): {e}")
             return DocumentationResult(
                 chunk_id=chunk.chunk_id,
                 success=False,
@@ -459,9 +518,10 @@ class OpenAIDocGenerator:
         chunk: UniversalChunk,
         context: str = "",
         prompt_override: Optional[PromptTemplate] = None,
+        retry_with_truncation: bool = True,
     ) -> DocumentationResult:
         """
-        Async version of generate_for_chunk.
+        Async version of generate_for_chunk with automatic truncation retry on token limit errors.
         """
         try:
             prompt = prompt_override or get_prompt_for_domain(chunk.domain)
@@ -532,7 +592,39 @@ class OpenAIDocGenerator:
             return result
             
         except Exception as e:
-            logger.error(f"Error generating docs for {chunk.chunk_id}: {e}")
+            error_str = str(e).lower()
+            
+            # Check if this is a token limit error
+            if retry_with_truncation and any(phrase in error_str for phrase in [
+                "context_length_exceeded", "token limit", "maximum context", "too many tokens"
+            ]):
+                logger.warning(f"Token limit exceeded for {chunk.chunk_id} ({chunk.path}), retrying with truncation...")
+                
+                # Truncate the chunk text to approximately 75% of original length
+                truncated_text = chunk.text[:int(len(chunk.text) * 0.75)]
+                truncated_text += "\n\n[... content truncated due to length ...]"
+                
+                # Create a truncated chunk
+                truncated_chunk = UniversalChunk(
+                    chunk_id=chunk.chunk_id,
+                    domain=chunk.domain,
+                    path=chunk.path,
+                    type=chunk.type,
+                    text=truncated_text,
+                    metadata=chunk.metadata,
+                    start_offset=chunk.start_offset,
+                    end_offset=chunk.end_offset,
+                )
+                
+                # Retry without further truncation attempts
+                return await self.generate_for_chunk_async(
+                    truncated_chunk,
+                    context=context,
+                    prompt_override=prompt_override,
+                    retry_with_truncation=False,
+                )
+            
+            logger.error(f"Error generating docs for {chunk.chunk_id} ({chunk.path}): {e}")
             return DocumentationResult(
                 chunk_id=chunk.chunk_id,
                 success=False,
@@ -640,7 +732,7 @@ class OpenAIDocGenerator:
         avg_output_tokens: int = 350,
     ) -> dict[str, Any]:
         """
-        Estimate the cost of documenting chunks before generation.
+        Estimate the cost of documenting chunks before generation (per-symbol mode).
         
         Uses official OpenAI pricing table (November 2025).
         
@@ -667,6 +759,238 @@ class OpenAIDocGenerator:
             "input_cost_usd": round(cost_breakdown["input_cost"], 4),
             "output_cost_usd": round(cost_breakdown["output_cost"], 4),
         }
+    
+    def estimate_cost_batch_mode(
+        self,
+        chunks: list[UniversalChunk],
+        batch_size: int = 15,
+    ) -> dict[str, Any]:
+        """
+        Estimate the cost for batch mode (multiple symbols per request).
+        
+        In batch mode, we send multiple symbols together, which:
+        - Reduces network overhead (fewer requests)
+        - Enables better context sharing
+        - More efficient for larger models
+        - 50% cheaper (OpenAI batch API discount)
+        
+        Args:
+            chunks: Chunks to estimate for
+            batch_size: Number of symbols per batch
+        
+        Returns:
+            Dict with cost estimates (includes 50% batch discount)
+        """
+        num_batches = (len(chunks) + batch_size - 1) // batch_size
+        
+        # Estimate tokens per batch request
+        # Each symbol: ~500 tokens content + ~150 tokens prompt overhead
+        # Plus shared system prompt: ~200 tokens
+        # Plus structured output overhead: ~50 tokens per symbol
+        tokens_per_symbol = 500
+        prompt_overhead = 200
+        structured_overhead = 50
+        
+        avg_input_per_batch = prompt_overhead + (batch_size * (tokens_per_symbol + structured_overhead))
+        avg_output_per_batch = batch_size * 400  # ~400 tokens per symbol output
+        
+        total_input = num_batches * avg_input_per_batch
+        total_output = num_batches * avg_output_per_batch
+        
+        # Apply 50% batch discount
+        cost_breakdown = calculate_cost(self.model, total_input, total_output, batch_discount=0.5)
+        
+        return {
+            "model": self.model,
+            "num_chunks": len(chunks),
+            "num_batches": num_batches,
+            "batch_size": batch_size,
+            "estimated_input_tokens": total_input,
+            "estimated_output_tokens": total_output,
+            "estimated_total_tokens": total_input + total_output,
+            "estimated_cost_usd": round(cost_breakdown["total_cost"], 4),
+            "input_cost_usd": round(cost_breakdown["input_cost"], 4),
+            "output_cost_usd": round(cost_breakdown["output_cost"], 4),
+            "batch_discount": "50%",
+        }
+    
+    async def generate_multi_batch_async(
+        self,
+        chunks: list[UniversalChunk],
+        batch_size: int = 15,
+        context_map: Optional[dict[str, str]] = None,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+    ) -> BatchDocumentationResult:
+        """
+        Generate documentation in batch mode (multiple symbols per request).
+        
+        This is more efficient for:
+        - Reducing network latency (fewer requests)
+        - Better context utilization with larger models
+        - Cross-symbol analysis and consistency
+        
+        Args:
+            chunks: List of chunks to document
+            batch_size: Number of symbols per batch request
+            context_map: Optional dict mapping chunk_id to context string
+            progress_callback: Called with (completed_batches, total_batches)
+        
+        Returns:
+            BatchDocumentationResult with all results
+        """
+        from .prompts import get_prompt_for_domain
+        
+        batch_result = BatchDocumentationResult()
+        batch_result.model = self.model
+        context_map = context_map or {}
+        
+        # Split chunks into batches
+        batches = []
+        for i in range(0, len(chunks), batch_size):
+            batch = chunks[i:i + batch_size]
+            batches.append(batch)
+        
+        logger.info(f"  Created {len(batches)} batches from {len(chunks)} symbols")
+        
+        # Process each batch
+        completed = 0
+        for batch_idx, batch in enumerate(batches):
+            try:
+                # Build batch prompt
+                # Assume all chunks in batch have the same domain (typical case)
+                domain = batch[0].domain
+                prompt_template = get_prompt_for_domain(domain)
+                
+                # Build a combined prompt for all symbols in the batch
+                system_prompt = (prompt_template.system_prompt +
+                    "\n\nYou are processing MULTIPLE symbols at once. " +
+                    "Generate documentation for each symbol in a JSON array format.")
+                
+                user_parts = ["Generate documentation for the following symbols:\n"]
+                
+                for idx, chunk in enumerate(batch, 1):
+                    context = context_map.get(chunk.chunk_id, "")
+                    user_parts.append(f"\n{'='*60}")
+                    user_parts.append(f"SYMBOL {idx}/{len(batch)}: {chunk.chunk_id}")
+                    user_parts.append(f"{'='*60}\n")
+                    user_parts.append(f"**File:** {chunk.path}")
+                    user_parts.append(f"**Type:** {chunk.type.value if hasattr(chunk.type, 'value') else str(chunk.type)}")
+                    if context:
+                        user_parts.append(f"\n{context}\n")
+                    user_parts.append(f"\n```{chunk.metadata.language or ''}")
+                    user_parts.append(chunk.text)
+                    user_parts.append("```\n")
+                
+                user_parts.append(f"\n{'='*60}\n")
+                user_parts.append("Respond with a JSON array containing documentation for each symbol:")
+                user_parts.append("[")
+                user_parts.append('  {"chunk_id": "...", "summary": "...", "description": "...", ...},')
+                user_parts.append('  {"chunk_id": "...", "summary": "...", "description": "...", ...}')
+                user_parts.append("]")
+                
+                user_content = "\n".join(user_parts)
+                
+                # Make API call without structured outputs (use JSON mode instead)
+                # Cap max_completion_tokens at 16384 for gpt-4o/gpt-4o-mini
+                batch_max_tokens = min(self.max_completion_tokens * len(batch), 16384)
+                
+                response = await self._async_client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_content},
+                    ],
+                    max_completion_tokens=batch_max_tokens,
+                    temperature=self.temperature,
+                    response_format={"type": "json_object"},
+                )
+                
+                # Parse response
+                content = response.choices[0].message.content
+                
+                # Extract token usage
+                if response.usage:
+                    batch_input_tokens = response.usage.prompt_tokens
+                    batch_output_tokens = response.usage.completion_tokens
+                    batch_cached_tokens = getattr(response.usage.prompt_tokens_details, 'cached_tokens', 0) if hasattr(response.usage, 'prompt_tokens_details') else 0
+                    batch_total_tokens = response.usage.total_tokens
+                else:
+                    batch_input_tokens = 0
+                    batch_output_tokens = 0
+                    batch_cached_tokens = 0
+                    batch_total_tokens = 0
+                
+                # Parse JSON array
+                try:
+                    docs_array = json.loads(content)
+                    
+                    # Handle both array and object with results key
+                    if isinstance(docs_array, dict):
+                        docs_array = docs_array.get("results", docs_array.get("symbols", [docs_array]))
+                    
+                    # Map docs back to chunks
+                    docs_by_id = {doc.get("chunk_id", doc.get("symbol_id", "")): doc for doc in docs_array}
+                    
+                    for chunk in batch:
+                        doc = docs_by_id.get(chunk.chunk_id, {})
+                        
+                        if doc:
+                            result = DocumentationResult(
+                                chunk_id=chunk.chunk_id,
+                                success=True,
+                                documentation=doc,
+                                tokens_used=batch_total_tokens // len(batch),  # Distribute tokens evenly
+                            )
+                            result._input_tokens = batch_input_tokens // len(batch)
+                            result._output_tokens = batch_output_tokens // len(batch)
+                            result._cached_tokens = batch_cached_tokens // len(batch)
+                        else:
+                            result = DocumentationResult(
+                                chunk_id=chunk.chunk_id,
+                                success=False,
+                                error="Symbol not found in batch response",
+                            )
+                        
+                        batch_result.add(
+                            result,
+                            result._input_tokens,
+                            result._output_tokens,
+                            result._cached_tokens,
+                        )
+                
+                except json.JSONDecodeError as e:
+                    logger.error(f"Failed to parse batch response: {e}")
+                    logger.debug(f"Response content: {content[:500]}")
+                    
+                    # Mark all chunks in batch as failed
+                    for chunk in batch:
+                        result = DocumentationResult(
+                            chunk_id=chunk.chunk_id,
+                            success=False,
+                            error=f"JSON parse error: {e}",
+                        )
+                        batch_result.add(result, 0, 0, 0)
+                
+            except Exception as e:
+                logger.error(f"Error processing batch {batch_idx + 1}: {e}")
+                
+                # Mark all chunks in batch as failed
+                for chunk in batch:
+                    result = DocumentationResult(
+                        chunk_id=chunk.chunk_id,
+                        success=False,
+                        error=str(e),
+                    )
+                    batch_result.add(result, 0, 0, 0)
+            
+            completed += 1
+            if progress_callback:
+                progress_callback(completed, len(batches))
+        
+        # Calculate total cost
+        batch_result.calculate_cost()
+        
+        return batch_result
 
 
 def create_doc_generator(

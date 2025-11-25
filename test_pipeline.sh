@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Capture start time for runtime analysis
+START_TIME=$(date +%s)
+START_TIMESTAMP=$(date --iso-8601=seconds)
+
 # =============================================================================
 # Doctown Full Pipeline Test
 # =============================================================================
@@ -18,6 +22,10 @@ set -euo pipefail
 #   ./test_pipeline.sh https://github.com/owner/repo
 #   ./test_pipeline.sh https://github.com/owner/repo --no-llm
 #   ./test_pipeline.sh https://github.com/owner/repo --llm-model gpt-4
+#
+# BATCH MODE (faster, better quality, recommended):
+#   ./test_pipeline.sh https://github.com/owner/repo --llm-batch-mode --llm-batch-size 15
+#   ./test_pipeline.sh https://github.com/owner/repo --llm-batch-mode --llm-batch-size 20 --max-batch-tokens 25000
 # =============================================================================
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,6 +36,25 @@ REPORTS_DIR="$ROOT_DIR/reports"
 
 log() { printf "%s %s\n" "$(date --iso-8601=seconds)" "$*"; }
 err() { log "ERROR:" "$*"; exit 1; }
+
+display_runtime() {
+  local end_time=$(date +%s)
+  local end_timestamp=$(date --iso-8601=seconds)
+  local duration=$((end_time - START_TIME))
+  local hours=$((duration / 3600))
+  local minutes=$(((duration % 3600) / 60))
+  local seconds=$((duration % 60))
+  
+  log ""
+  log "================================================"
+  log "  ⏱️  RUNTIME ANALYSIS"
+  log "================================================"
+  log "Start:    $START_TIMESTAMP"
+  log "End:      $end_timestamp"
+  log "Duration: ${hours}h ${minutes}m ${seconds}s (${duration} seconds total)"
+  log "================================================"
+  log ""
+}
 
 # Parse arguments
 INPUT=${1:-}
@@ -146,6 +173,9 @@ test_full_pipeline() {
       ls -lh "$OUTPUT_DIR"/*.docpack 2>/dev/null || log "  (no .docpack files found)"
     fi
     
+    # Calculate and display runtime
+    display_runtime
+    
     # Generate test report
     generate_test_report "$exit_code" "$input" "${extra_args[@]}"
     
@@ -158,6 +188,10 @@ test_full_pipeline() {
     log "Exit code: $exit_code"
     log ""
     
+    # Calculate and display runtime
+    display_runtime
+    
+    # Generate test report
     generate_test_report "$exit_code" "$input" "${extra_args[@]}"
     
     return $exit_code

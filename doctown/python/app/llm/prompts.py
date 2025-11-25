@@ -80,8 +80,10 @@ Guidelines:
 2. WHY: Explain why it exists (purpose/motivation)  
 3. HOW: Show how to use it (API, parameters, return values)
 4. WHEN: Mention when to use it (use cases, constraints)
+5. RELATIONSHIPS: When semantic context is provided, explain how this code relates to similar code
 
 Be precise about types, parameters, and return values. Mention edge cases and potential issues.
+Use provided semantic relationships to understand implementation patterns and cross-references.
 Always respond with valid JSON matching the requested schema."""
 
 CODE_USER_TEMPLATE = """Generate documentation for this code:
@@ -95,6 +97,12 @@ CODE_USER_TEMPLATE = """Generate documentation for this code:
 ```
 
 {context}
+
+**Analysis Guidelines:**
+- If semantic relationships are provided above, use them to understand how this code fits into the broader system
+- Identify patterns, conventions, and architectural relationships
+- Reference related code when explaining functionality
+- Note any implementation similarities or differences with related code
 
 Respond with JSON:
 {{

@@ -94,8 +94,13 @@ def cmd_build_llm(args: argparse.Namespace) -> int:
         embedding_batch_size=args.batch_size,
         use_llm=not args.no_llm,
         llm_model=args.llm_model,
+        llm_batch_mode=args.llm_batch_mode,
+        llm_batch_size=args.llm_batch_size,
+        llm_max_batch_tokens=args.max_batch_tokens,
+        include_semantic_context=args.include_semantic_context,
         llm_max_concurrent=args.llm_concurrent,
         llm_max_chunks=args.llm_max_chunks,
+        llm_semantic_neighbors=args.llm_semantic_neighbors,
         ingestor_name=args.ingestor,
     )
     
@@ -324,16 +329,44 @@ def main(argv: list[str] | None = None) -> int:
         help="OpenAI model to use (default: gpt-5-nano via env)",
     )
     build_llm_parser.add_argument(
+        "--llm-batch-mode",
+        action="store_true",
+        help="Use batch mode (multiple symbols per request, better for latency)",
+    )
+    build_llm_parser.add_argument(
+        "--llm-batch-size",
+        type=int,
+        default=15,
+        help="Symbols per batch request in batch mode (default: 15)",
+    )
+    build_llm_parser.add_argument(
         "--llm-concurrent",
         type=int,
         default=10,
-        help="Max concurrent LLM requests (default: 10)",
+        help="Max concurrent LLM requests in per-symbol mode (default: 10)",
     )
     build_llm_parser.add_argument(
         "--llm-max-chunks",
         type=int,
         default=None,
         help="Limit chunks for LLM docs (cost control)",
+    )
+    build_llm_parser.add_argument(
+        "--llm-semantic-neighbors",
+        type=int,
+        default=3,
+        help="Number of semantic neighbors to include as context (default: 3)",
+    )
+    build_llm_parser.add_argument(
+        "--max-batch-tokens",
+        type=int,
+        default=30000,
+        help="Max input tokens per batch in batch mode (default: 30000)",
+    )
+    build_llm_parser.add_argument(
+        "--include-semantic-context",
+        action="store_true",
+        help="Include semantic relationships from embeddings in LLM prompts",
     )
     build_llm_parser.add_argument(
         "--ingestor",

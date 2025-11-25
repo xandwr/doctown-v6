@@ -68,8 +68,13 @@ class PipelineConfig:
     # Documentation
     use_llm: bool = True  # Use OpenAI for docs if available
     llm_model: Optional[str] = None  # Uses OPENAI_MODEL env var if None
-    llm_max_concurrent: int = 10
+    llm_batch_mode: bool = False  # Use batch mode (multiple symbols per request)
+    llm_batch_size: int = 15  # Symbols per batch request
+    llm_max_batch_tokens: int = 30000  # Max input tokens per batch
+    include_semantic_context: bool = False  # Include semantic relationships in prompts
+    llm_max_concurrent: int = 10  # For per-symbol mode
     llm_max_chunks: Optional[int] = None  # Limit chunks for LLM (cost control)
+    llm_semantic_neighbors: int = 3  # Number of semantic neighbors to include as context
     
     # Graph
     similarity_threshold: float = 0.7
@@ -169,7 +174,11 @@ class DocumentationPipeline:
             
             # Step 6: Generate documentation
             logger.info("Step 6/7: Generating documentation...")
-            docs = await self._generate_documentation(chunks, ingestor)
+            docs = await self._generate_documentation(
+                chunks,
+                ingestor,
+                embeddings=embeddings_meta.get("embeddings_array"),
+            )
             
             # Step 7: Package into docpack
             logger.info("Step 7/7: Packaging docpack...")
@@ -377,6 +386,50 @@ class DocumentationPipeline:
             "model_info": embedder.get_model_info(),
         }
     
+    def _compute_semantic_neighbors(
+        self,
+        chunks: list[UniversalChunk],
+        embeddings: np.ndarray,
+        k: int = 3,
+    ) -> dict[str, list[tuple[str, float]]]:
+        """
+        Compute k-nearest neighbors for each chunk using cosine similarity.
+        
+        Returns:
+            Dict mapping chunk_id -> [(neighbor_chunk_id, similarity_score), ...]
+        """
+        if embeddings.size == 0 or k <= 0:
+            return {}
+        
+        # Normalize embeddings for cosine similarity
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        norms = np.where(norms == 0, 1, norms)  # Avoid division by zero
+        normalized = embeddings / norms
+        
+        # Compute similarity matrix
+        similarity_matrix = normalized @ normalized.T
+        
+        # Extract top-k neighbors for each chunk
+        neighbors_map = {}
+        for i, chunk in enumerate(chunks):
+            # Get similarities for this chunk (excluding self)
+            similarities = similarity_matrix[i]
+            similarities[i] = -1  # Exclude self
+            
+            # Get top-k indices
+            top_k_indices = np.argsort(similarities)[-k:][::-1]
+            
+            # Build neighbor list with chunk IDs and scores
+            neighbors = [
+                (chunks[j].chunk_id, float(similarities[j]))
+                for j in top_k_indices
+                if similarities[j] > 0.3  # Minimum similarity threshold
+            ]
+            
+            neighbors_map[chunk.chunk_id] = neighbors
+        
+        return neighbors_map
+    
     def _build_graph(
         self,
         chunks: list[UniversalChunk],
@@ -462,6 +515,7 @@ class DocumentationPipeline:
         self,
         chunks: list[UniversalChunk],
         ingestor: DomainIngestor,
+        embeddings: Optional[np.ndarray] = None,
     ) -> dict:
         """
         Generate documentation for chunks.
@@ -471,7 +525,7 @@ class DocumentationPipeline:
         if self.config.use_llm:
             doc_generator = self._get_doc_generator()
             if doc_generator:
-                return await self._generate_llm_docs(chunks, doc_generator)
+                return await self._generate_llm_docs(chunks, doc_generator, embeddings)
         
         # Fallback to rule-based
         return self._generate_rule_based_docs(chunks)
@@ -486,11 +540,22 @@ class DocumentationPipeline:
         self,
         chunks: list[UniversalChunk],
         generator: OpenAIDocGenerator,
+        embeddings: Optional[np.ndarray] = None,
     ) -> dict:
-        """Generate documentation using LLM."""
+        """
+        Generate documentation using LLM.
+        
+        Supports two modes:
+        1. Per-symbol mode (default): Each symbol gets its own request, processed in parallel
+        2. Batch mode: Multiple symbols per request for better latency and context utilization
+        
+        When embeddings are provided, enriches context with semantic neighbors.
+        """
+        from .llm.openai_client import estimate_tokens
+        
         # Optionally limit chunks for cost control
         if self.config.llm_max_chunks and len(chunks) > self.config.llm_max_chunks:
-            logger.info(f"  Limiting LLM docs to {self.config.llm_max_chunks} chunks (have {len(chunks)})")
+            logger.info(f"  Limiting LLM docs to {self.config.llm_max_chunks} symbols (have {len(chunks)})")
             # Prioritize first chunk of each file
             seen_paths = set()
             priority_chunks = []
@@ -510,24 +575,117 @@ class DocumentationPipeline:
         else:
             chunks_to_document = chunks
         
+        # Compute semantic neighbors if embeddings available
+        semantic_neighbors_map = {}
+        if embeddings is not None and self.config.llm_semantic_neighbors > 0:
+            logger.info(f"  Computing semantic neighbors (k={self.config.llm_semantic_neighbors})...")
+            semantic_neighbors_map = self._compute_semantic_neighbors(
+                chunks_to_document,
+                embeddings[:len(chunks_to_document)],
+                k=self.config.llm_semantic_neighbors,
+            )
+        
+        # Build context map with semantic information
+        context_map = {}
+        chunk_by_id = {c.chunk_id: c for c in chunks_to_document}
+        
+        for chunk in chunks_to_document:
+            context_parts = []
+            
+            # Add semantic neighbors
+            neighbors = semantic_neighbors_map.get(chunk.chunk_id, [])
+            if neighbors:
+                context_parts.append("**Semantically Related:**")
+                for neighbor_id, score in neighbors[:self.config.llm_semantic_neighbors]:
+                    neighbor = chunk_by_id.get(neighbor_id)
+                    if neighbor:
+                        preview = neighbor.text[:100].replace('\n', ' ')
+                        context_parts.append(f"- {neighbor.path} (similarity: {score:.2f}): {preview}...")
+            
+            if context_parts:
+                context_map[chunk.chunk_id] = "\n".join(context_parts)
+        
+        # Analyze token distribution
+        token_estimates = [(chunk, estimate_tokens(chunk.text)) for chunk in chunks_to_document]
+        total_estimated_tokens = sum(tokens for _, tokens in token_estimates)
+        large_symbols = [chunk for chunk, tokens in token_estimates if tokens > 1000]
+        medium_symbols = [chunk for chunk, tokens in token_estimates if 300 <= tokens <= 1000]
+        small_symbols = [chunk for chunk, tokens in token_estimates if tokens < 300]
+        
+        logger.info(f"  Symbol distribution: {len(large_symbols)} large (>4K chars), "
+                   f"{len(medium_symbols)} medium (1.2-4K chars), {len(small_symbols)} small (<1.2K chars)")
+        logger.info(f"  Total estimated input: ~{total_estimated_tokens:,} tokens")
+        
         # Show cost estimate
-        estimate = generator.estimate_cost(chunks_to_document)
-        logger.info(f"  Estimated LLM cost: ${estimate['estimated_cost_usd']:.4f} for {len(chunks_to_document)} chunks")
-        logger.info(f"    Model: {estimate['model']}, ~{estimate['estimated_total_tokens']:,} tokens")
+        if self.config.llm_batch_mode:
+            # Batch mode uses smarter models with larger context
+            estimate = generator.estimate_cost_batch_mode(
+                chunks_to_document,
+                batch_size=self.config.llm_batch_size,
+            )
+            logger.info(f"  Estimated LLM cost (BATCH MODE): ${estimate['estimated_cost_usd']:.4f} (with 50% batch discount)")
+            logger.info(f"    Model: {estimate['model']}, ~{estimate['num_batches']} batches, "
+                       f"~{estimate['estimated_total_tokens']:,} tokens")
+        else:
+            estimate = generator.estimate_cost(chunks_to_document)
+            logger.info(f"  Estimated LLM cost: ${estimate['estimated_cost_usd']:.4f} for {len(chunks_to_document)} symbols")
+            logger.info(f"    Model: {estimate['model']}, ~{estimate['estimated_total_tokens']:,} tokens")
         
-        # Generate docs
-        def progress(done: int, total: int):
-            if done % 10 == 0 or done == total:
-                logger.info(f"    Progress: {done}/{total} chunks")
+        # Choose processing mode
+        if self.config.llm_batch_mode:
+            # BATCH MODE: Multiple symbols per request, better latency
+            logger.info(f"  Processing {len(chunks_to_document)} symbols in BATCH MODE "
+                       f"({self.config.llm_batch_size} symbols/batch)...")
+            
+            completed_count = 0
+            
+            def progress(done: int, total: int):
+                nonlocal completed_count
+                completed_count = done
+                logger.info(f"    Progress: {done}/{total} batches completed")
+            
+            result = await generator.generate_multi_batch_async(
+                chunks_to_document,
+                batch_size=self.config.llm_batch_size,
+                context_map=context_map,
+                progress_callback=progress,
+            )
+        else:
+            # PER-SYMBOL MODE: Each symbol gets its own request
+            logger.info(f"  Processing {len(chunks_to_document)} symbols with max {self.config.llm_max_concurrent} concurrent requests...")
+            
+            completed_count = 0
+            
+            def progress(done: int, total: int):
+                nonlocal completed_count
+                completed_count = done
+                if done % 10 == 0 or done == total:
+                    logger.info(f"    Progress: {done}/{total} symbols documented")
+            
+            result = await generator.generate_batch_async(
+                chunks_to_document,
+                context_map=context_map,
+                max_concurrent=self.config.llm_max_concurrent,
+                progress_callback=progress,
+            )
         
-        result = await generator.generate_batch_async(
-            chunks_to_document,
-            max_concurrent=self.config.llm_max_concurrent,
-            progress_callback=progress,
-        )
+        failed_symbols = []
         
-        # Show detailed cost breakdown
-        logger.info(f"  LLM docs: {result.successful} successful, {result.failed} failed")
+        # Collect failed symbols for logging
+        for doc_result in result.results:
+            if not doc_result.success:
+                chunk = next((c for c in chunks_to_document if c.chunk_id == doc_result.chunk_id), None)
+                if chunk:
+                    failed_symbols.append((chunk.path, doc_result.error))
+        
+        # Show detailed results
+        logger.info(f"  ✓ LLM docs: {result.successful} successful, {result.failed} failed")
+        if failed_symbols:
+            logger.warning(f"  Failed symbols (showing first 5):")
+            for path, error in failed_symbols[:5]:
+                error_msg = error[:100] + "..." if error and len(error) > 100 else error
+                logger.warning(f"    - {path}: {error_msg}")
+        
         logger.info(f"  Token usage: {result.input_tokens:,} input + {result.output_tokens:,} output = {result.total_tokens:,} total")
         if result.cached_tokens > 0:
             logger.info(f"  Cached tokens: {result.cached_tokens:,}")
