@@ -8,13 +8,34 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DOCTOWN_DIR="$ROOT_DIR/doctown"
 RUST_DIR="$DOCTOWN_DIR/rust"
-PY_APP_DIR="$DOCTOWN_DIR/python/app"
+PY_DIR="$DOCTOWN_DIR/python"
+PY_APP_DIR="$PY_DIR/app"
+PY_VENV="$PY_DIR/venv"
 
 log() { printf "%s %s\n" "$(date --iso-8601=seconds)" "$*"; }
 err() { log "ERROR:" "$*"; exit 1; }
 
 check_cmd() {
   command -v "$1" >/dev/null 2>&1 || err "Required command '$1' not found in PATH"
+}
+
+setup_python_env() {
+  log "Checking Python environment..."
+  if [ ! -d "$PY_VENV" ]; then
+    log "Virtual environment not found. Creating it now..."
+    check_cmd python3
+    (cd "$PY_DIR" && bash setup_venv.sh)
+  else
+    log "Virtual environment exists at $PY_VENV"
+  fi
+}
+
+get_python_cmd() {
+  if [ -f "$PY_VENV/bin/python" ]; then
+    echo "$PY_VENV/bin/python"
+  else
+    echo "python3"
+  fi
 }
 
 build_rust() {
@@ -39,52 +60,105 @@ ingest_repo() {
 
 run_python() {
   log "Running Python app (attempting to run $PY_APP_DIR/main.py)..."
-  check_cmd python3
+  local python_cmd=$(get_python_cmd)
   if [ -f "$PY_APP_DIR/main.py" ]; then
-    (cd "$PY_APP_DIR" && python3 main.py)
+    (cd "$PY_APP_DIR" && "$python_cmd" main.py)
   else
     log "No main.py found in $PY_APP_DIR; skipping"
   fi
 }
 
 embed_texts() {
-  local texts_file=${1:-}
-  if [ -n "$texts_file" ] && [ ! -f "$texts_file" ]; then
-    err "texts file '$texts_file' not found"
-  fi
-  check_cmd python3
-  log "Running embedder (Python)"
-  # Run a small inline snippet that imports embedder.py and calls embed if available.
-  python3 - <<PY
+  log "Running embedder test (Python)"
+  setup_python_env
+  local python_cmd=$(get_python_cmd)
+  
+  # Set environment variables for the Python script
+  export EMBEDDING_MODEL_PRESET=fast
+  export PY_APP_DIR="$PY_APP_DIR"
+  
+  # Run embedder test with proper error handling
+  "$python_cmd" - <<'PY'
 import sys
-sys.path.insert(0, "$PY_APP_DIR")
-try:
-    import embedder
-    if hasattr(embedder, 'embed'):
-        samples = ["hello world", "example text"]
-        print('Embedding sample texts:', samples)
-        vecs = embedder.embed(samples)
-        print('Vectors:', vecs)
-    else:
-        print('embedder.py loaded but no embed() function found — treat as placeholder')
-except Exception as e:
-    print('embedder invocation failed (this may be expected if embedder is unimplemented):', e)
+import os
+sys.path.insert(0, os.environ.get('PY_APP_DIR', '.'))
+
+def test_embedder():
+    """Test the embedder with sample texts"""
+    try:
+        from embedder import embed_texts
+        
+        # Sample texts to embed
+        samples = [
+            "hello world",
+            "testing the embedding pipeline",
+            "code documentation search"
+        ]
+        
+        print(f"📝 Testing embedder with {len(samples)} sample texts...")
+        print(f"   Model preset: {os.getenv('EMBEDDING_MODEL_PRESET', 'default')}")
+        
+        # Generate embeddings
+        embeddings = embed_texts(samples)
+        
+        print(f"\n✅ Embeddings generated successfully!")
+        print(f"   Shape: {embeddings.shape}")
+        print(f"   Dtype: {embeddings.dtype}")
+        print(f"   Sample vector (first 5 dims): {embeddings[0][:5].tolist()}")
+        
+        return True
+        
+    except ImportError as e:
+        print(f"❌ Import error: {e}")
+        print("   Make sure dependencies are installed: pip install -r requirements.txt")
+        return False
+    except Exception as e:
+        print(f"❌ Embedder test failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+if __name__ == "__main__":
+    success = test_embedder()
+    sys.exit(0 if success else 1)
 PY
+  
+  local exit_code=$?
+  if [ $exit_code -eq 0 ]; then
+    log "✓ Embedder test passed"
+  else
+    log "✗ Embedder test failed (exit code: $exit_code)"
+    return $exit_code
+  fi
 }
 
 full_pipeline() {
   local input=${1:-}
   log "Starting full pipeline"
+  
+  # Setup Python environment first
+  setup_python_env
+  
+  # Build Rust ingest tool
   build_rust
+  
+  # Run ingest if input provided
   if [ -n "$input" ]; then
     ingest_repo "$input"
   else
     log "No input repo provided; skipping ingest_repo"
   fi
-  # run_python could be a long-running server; keep it optional
+  
+  # Run Python app smoke check (optional)
   log "(Optional) Running python app as a smoke check"
   run_python || log "python app step returned non-zero (continuing)"
-  embed_texts
+  
+  # Test embedder (critical component)
+  log "Testing embedder functionality..."
+  if ! embed_texts; then
+    log "WARNING: Embedder test failed, but continuing pipeline"
+  fi
+  
   log "Full pipeline finished"
 }
 
@@ -96,14 +170,21 @@ Commands:
   build_rust                 Build the Rust ingest tool (cargo build)
   ingest <input>             Run the Rust ingest on a GitHub URL or zip path
   run_python                 Run the Python app (if main.py exists)
-  embed [texts_file]         Run the embedder smoke check (calls embed())
-  full [input]               Run the full pipeline: build -> ingest (optional) -> python -> embed
+  embed                      Test the embedder with sample texts (auto-setup venv)
+  full [input]               Run the full pipeline: setup -> build -> ingest -> embed
   help                       Show this help
+
+Environment Variables:
+  EMBEDDING_MODEL_PRESET     Model preset: fast, balanced, quality, multilingual, code (default: fast)
+  EMBEDDING_MODEL            Override with specific HuggingFace model ID
+  EMBEDDING_DEVICE           Device: cuda, cpu, or auto (default: auto)
 
 Examples:
   $0 build_rust
   $0 ingest https://github.com/owner/repo
+  $0 embed
   $0 full https://github.com/owner/repo
+  EMBEDDING_MODEL_PRESET=balanced $0 full https://github.com/owner/repo
 USAGE
 }
 

@@ -2,3 +2,4 @@
 !.env.example
 *.onnx
 /target
+/models
