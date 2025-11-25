@@ -71,6 +71,7 @@ class PipelineConfig:
     llm_batch_mode: bool = False  # Use batch mode (multiple symbols per request)
     llm_batch_size: int = 15  # Symbols per batch request
     llm_max_batch_tokens: int = 30000  # Max input tokens per batch
+    llm_batch_workers: int = 8  # Parallel workers for batch mode processing
     include_semantic_context: bool = False  # Include semantic relationships in prompts
     llm_max_concurrent: int = 10  # For per-symbol mode
     llm_max_chunks: Optional[int] = None  # Limit chunks for LLM (cost control)
@@ -649,6 +650,7 @@ class DocumentationPipeline:
                 batch_size=self.config.llm_batch_size,
                 context_map=context_map,
                 progress_callback=progress,
+                max_workers=self.config.llm_batch_workers,
             )
         else:
             # PER-SYMBOL MODE: Each symbol gets its own request

@@ -11,6 +11,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # We use 25K to leave headroom for response tokens
 BATCH_SIZE=15              # Process 15 symbols at once
 MAX_BATCH_TOKENS=25000     # Stay under 30K TPM limit
+BATCH_WORKERS=8            # Parallel workers for maximum throughput
 INCLUDE_SEMANTIC=true      # Include semantic context from embeddings
 
 log() { printf "%s %s\n" "$(date --iso-8601=seconds)" "$*"; }
@@ -40,6 +41,7 @@ EXTRA_ARGS=("$@")
 BATCH_ARGS=(
     "--llm-batch-mode"
     "--llm-batch-size" "$BATCH_SIZE"
+    "--llm-batch-workers" "$BATCH_WORKERS"
     "--max-batch-tokens" "$MAX_BATCH_TOKENS"
 )
 
@@ -48,10 +50,11 @@ if [ "$INCLUDE_SEMANTIC" = true ]; then
 fi
 
 log "================================================"
-log "  🚀 Running Pipeline in BATCH MODE"
+log "  🚀 Running Pipeline in PARALLEL BATCH MODE"
 log "================================================"
 log "Input:             $INPUT"
 log "Batch Size:        $BATCH_SIZE symbols per request"
+log "Batch Workers:     $BATCH_WORKERS parallel workers"
 log "Max Batch Tokens:  $MAX_BATCH_TOKENS tokens"
 log "Semantic Context:  $INCLUDE_SEMANTIC"
 log "Extra Args:        ${EXTRA_ARGS[*]:-none}"

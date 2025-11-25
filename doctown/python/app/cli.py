@@ -96,6 +96,7 @@ def cmd_build_llm(args: argparse.Namespace) -> int:
         llm_model=args.llm_model,
         llm_batch_mode=args.llm_batch_mode,
         llm_batch_size=args.llm_batch_size,
+        llm_batch_workers=args.llm_batch_workers,
         llm_max_batch_tokens=args.max_batch_tokens,
         include_semantic_context=args.include_semantic_context,
         llm_max_concurrent=args.llm_concurrent,
@@ -338,6 +339,12 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=15,
         help="Symbols per batch request in batch mode (default: 15)",
+    )
+    build_llm_parser.add_argument(
+        "--llm-batch-workers",
+        type=int,
+        default=8,
+        help="Parallel workers for batch mode processing (default: 8)",
     )
     build_llm_parser.add_argument(
         "--llm-concurrent",

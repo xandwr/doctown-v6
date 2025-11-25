@@ -1,13 +1,13 @@
 # Doctown Pipeline Test Report
 
-**Date**: 2025-11-25T13:28:17-07:00
+**Date**: 2025-11-25T13:37:54-07:00
 **Test**: Full Pipeline (build-llm)
 **Status**: ✅ PASSED
 
 ## Test Configuration
 
 - **Input**: https://github.com/pykeio/ort
-- **Extra Args**: --llm-batch-mode --llm-batch-size 15 --max-batch-tokens 25000 --include-semantic-context
+- **Extra Args**: --llm-batch-mode --llm-batch-size 15 --llm-batch-workers 8 --max-batch-tokens 25000 --include-semantic-context
 - **LLM Enabled**: true
 - **Output Directory**: /home/xander/Documents/doctown-v6/output
 

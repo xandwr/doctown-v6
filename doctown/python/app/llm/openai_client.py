@@ -874,9 +874,13 @@ class OpenAIDocGenerator:
         batch_size: int = 15,
         context_map: Optional[dict[str, str]] = None,
         progress_callback: Optional[Callable[[int, int], None]] = None,
+        max_workers: int = 8,
     ) -> BatchDocumentationResult:
         """
-        Generate documentation in batch mode with STRICT structured output.
+        Generate documentation in batch mode with PARALLEL workers and STRICT structured output.
+        
+        Uses up to max_workers concurrent workers to process batches in parallel, dramatically
+        reducing total processing time from N sequential to ~N/max_workers.
         
         Uses OpenAI structured outputs API to ensure:
         - No missing symbols
@@ -891,11 +895,13 @@ class OpenAIDocGenerator:
             batch_size: Number of symbols per batch request
             context_map: Optional dict mapping chunk_id to context string
             progress_callback: Called with (completed_batches, total_batches)
+            max_workers: Maximum concurrent workers (default: 8)
         
         Returns:
             BatchDocumentationResult with all results
         """
         from .prompts import get_prompt_for_domain
+        import sys
         
         batch_result = BatchDocumentationResult()
         batch_result.model = self.model
@@ -908,10 +914,44 @@ class OpenAIDocGenerator:
             batches.append(batch)
         
         logger.info(f"  Created {len(batches)} batches from {len(chunks)} symbols")
+        logger.info(f"  Processing with {max_workers} parallel workers")
         
-        # Process each batch
+        # Worker state tracking for visual display
+        worker_states = {i: {"status": "idle", "batch_num": None} for i in range(max_workers)}
         completed = 0
-        for batch_idx, batch in enumerate(batches):
+        lock = asyncio.Lock()
+        
+        def update_worker_display():
+            """Update the terminal display showing all workers."""
+            # Move cursor up to overwrite previous output
+            if completed > 0:
+                sys.stderr.write(f"\033[{max_workers + 1}A")
+            
+            # Display each worker's status
+            for worker_id in range(max_workers):
+                state = worker_states[worker_id]
+                if state["status"] == "processing" and state["batch_num"] is not None:
+                    status_line = f"  Worker {worker_id + 1}: Processing batch {state['batch_num']}/{len(batches)}"
+                elif state["status"] == "completed" and state["batch_num"] is not None:
+                    status_line = f"  Worker {worker_id + 1}: ✓ Completed batch {state['batch_num']}/{len(batches)}"
+                else:
+                    status_line = f"  Worker {worker_id + 1}: Idle"
+                
+                # Pad to 80 chars and add newline
+                sys.stderr.write(f"{status_line:<80}\n")
+            
+            # Progress summary
+            sys.stderr.write(f"  Overall progress: {completed}/{len(batches)} batches completed{' ' * 20}\n")
+            sys.stderr.flush()
+        
+        async def process_single_batch(worker_id: int, batch_idx: int, batch: list):
+            """Process a single batch and update worker state."""
+            nonlocal completed
+            
+            async with lock:
+                worker_states[worker_id] = {"status": "processing", "batch_num": batch_idx + 1}
+                update_worker_display()
+            
             try:
                 # Build structured input
                 domain = batch[0].domain
@@ -1018,7 +1058,7 @@ SYMBOLS TO DOCUMENT:
                             error="Failed to parse structured output from LLM",
                         )
                         batch_result.add(result, 0, 0, 0)
-                    continue
+                    return  # Exit this worker task early
                 
                 # Validate completeness
                 requested_ids = [chunk.chunk_id for chunk in batch]
@@ -1117,17 +1157,58 @@ SYMBOLS TO DOCUMENT:
                 logger.exception(e)
                 
                 # Mark all chunks in batch as failed
-                for chunk in batch:
-                    result = DocumentationResult(
-                        chunk_id=chunk.chunk_id,
-                        success=False,
-                        error=str(e),
-                    )
-                    batch_result.add(result, 0, 0, 0)
+                async with lock:
+                    for chunk in batch:
+                        result = DocumentationResult(
+                            chunk_id=chunk.chunk_id,
+                            success=False,
+                            error=str(e),
+                        )
+                        batch_result.add(result, 0, 0, 0)
             
-            completed += 1
-            if progress_callback:
-                progress_callback(completed, len(batches))
+            # Update worker state and progress
+            async with lock:
+                worker_states[worker_id] = {"status": "completed", "batch_num": batch_idx + 1}
+                completed += 1
+                update_worker_display()
+                if progress_callback:
+                    progress_callback(completed, len(batches))
+        
+        # Initialize display
+        update_worker_display()
+        
+        # Create queue of batch jobs
+        batch_queue = asyncio.Queue()
+        for idx, batch in enumerate(batches):
+            await batch_queue.put((idx, batch))
+        
+        # Worker coroutine
+        async def worker(worker_id: int):
+            """Worker that pulls jobs from the queue until empty."""
+            while True:
+                try:
+                    # Get next batch from queue (non-blocking with timeout)
+                    batch_idx, batch = await asyncio.wait_for(
+                        batch_queue.get(), timeout=0.1
+                    )
+                    await process_single_batch(worker_id, batch_idx, batch)
+                    batch_queue.task_done()
+                except asyncio.TimeoutError:
+                    # Queue is empty, exit worker
+                    break
+                except Exception as e:
+                    logger.error(f"Worker {worker_id} error: {e}")
+                    break
+        
+        # Launch workers
+        workers = [asyncio.create_task(worker(i)) for i in range(max_workers)]
+        
+        # Wait for all workers to complete
+        await asyncio.gather(*workers, return_exceptions=True)
+        
+        # Final display update
+        async with lock:
+            update_worker_display()
         
         # Calculate total cost
         batch_result.calculate_cost()

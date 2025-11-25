@@ -8,8 +8,10 @@
 - ❌ No semantic context from embeddings → LLM had to guess relationships
 - ❌ Small models only (gpt-5-nano with 4K tokens) → quality suffered
 
-**After (Batch Mode):**
+**After (Parallel Batch Mode):**
 - ✅ Multiple symbols per request → **much faster** (fewer round trips)
+- ✅ **Up to 8 parallel workers** → process batches concurrently
+- ✅ Reduces time from N sequential to ~N/8 for maximum throughput
 - ✅ Stays under rate limits with intelligent batching
 - ✅ Semantic context included → LLM gets explicit implementation details
 - ✅ Larger models supported (gpt-4o with 128K context) → better quality
@@ -26,8 +28,9 @@ This automatically sets optimal batch mode parameters for you.
 ### Option 2: Manual Batch Mode Configuration
 ```bash
 ./test_pipeline.sh https://github.com/owner/repo \
-  --batch-mode \
-  --batch-size 15 \
+  --llm-batch-mode \
+  --llm-batch-size 15 \
+  --llm-batch-workers 8 \
   --max-batch-tokens 25000 \
   --include-semantic-context
 ```
@@ -38,11 +41,12 @@ cd doctown/python
 source venv/bin/activate
 
 python -m app.cli build-llm https://github.com/owner/repo \
-  --batch-mode \
-  --batch-size 15 \
+  --llm-batch-mode \
+  --llm-batch-size 15 \
+  --llm-batch-workers 8 \
   --max-batch-tokens 25000 \
   --include-semantic-context \
-  --model gpt-4o
+  --llm-model gpt-4o
 ```
 
 ## Configuration Options
@@ -51,11 +55,12 @@ python -m app.cli build-llm https://github.com/owner/repo \
 
 | Flag | Description | Default | Recommended |
 |------|-------------|---------|-------------|
-| `--batch-mode` | Enable batch processing | Off | **Always use** |
-| `--batch-size` | Symbols per batch | 10 | 15-20 for gpt-4o |
+| `--llm-batch-mode` | Enable batch processing | Off | **Always use** |
+| `--llm-batch-size` | Symbols per batch | 15 | 15-20 for gpt-4o |
+| `--llm-batch-workers` | Parallel workers | 8 | 4-8 depending on API limits |
 | `--max-batch-tokens` | Max input tokens per batch | 30000 | 25000 (leaves room for response) |
 | `--include-semantic-context` | Add embedding-based context | Off | **Always use** |
-| `--model` | OpenAI model | gpt-5-nano | gpt-4o or gpt-4o-mini |
+| `--llm-model` | OpenAI model | gpt-5-nano | gpt-4o or gpt-4o-mini |
 
 ### Model Selection
 
