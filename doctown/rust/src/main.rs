@@ -2,8 +2,9 @@
 
 use clap::Parser;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::{self, Read};
+use std::io;
 use std::path::Path;
 use tempfile::TempDir;
 use zip::ZipArchive;
@@ -23,6 +24,14 @@ struct Args {
     /// Pretty print JSON output
     #[arg(short, long, default_value = "false")]
     pretty: bool,
+
+    /// Enable chunking and output chunks.json
+    #[arg(short, long, default_value = "false")]
+    chunks: bool,
+
+    /// Chunk size in characters (default: 240)
+    #[arg(long, default_value = "240")]
+    chunk_size: usize,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -42,6 +51,23 @@ struct RepoStructure {
     repo_url: String,
     branch: String,
     structure: FileNode,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct Chunk {
+    chunk_id: String,
+    file_path: String,
+    start: usize,
+    end: usize,
+    text: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct ChunksOutput {
+    repo_url: String,
+    branch: String,
+    total_chunks: usize,
+    chunks: Vec<Chunk>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -76,12 +102,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         build_file_structure(&root_dir, root_dir.file_name().unwrap().to_str().unwrap())?;
 
     let repo_structure = RepoStructure {
-        repo_url: args.input,
-        branch: args.branch,
+        repo_url: args.input.clone(),
+        branch: args.branch.clone(),
         structure,
     };
 
-    // Output JSON
+    // Output filestructure JSON
     let json = if args.pretty {
         serde_json::to_string_pretty(&repo_structure)?
     } else {
@@ -89,6 +115,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     println!("{}", json);
+
+    // If chunking is enabled, also generate chunks.json
+    if args.chunks {
+        eprintln!("\nGenerating chunks...");
+        let chunks = extract_chunks(&root_dir, args.chunk_size)?;
+        let chunks_output = ChunksOutput {
+            repo_url: args.input,
+            branch: args.branch,
+            total_chunks: chunks.len(),
+            chunks,
+        };
+
+        let chunks_json = if args.pretty {
+            serde_json::to_string_pretty(&chunks_output)?
+        } else {
+            serde_json::to_string(&chunks_output)?
+        };
+
+        eprintln!("\n--- CHUNKS OUTPUT ---");
+        println!("{}", chunks_json);
+    }
 
     // temp_dir is automatically cleaned up when it goes out of scope
     Ok(())
@@ -217,4 +264,91 @@ fn build_file_structure(path: &Path, name: &str) -> Result<FileNode, Box<dyn std
             children,
         })
     }
+}
+
+/// Extract and chunk text content from all files in the repository
+fn extract_chunks(root_dir: &Path, chunk_size: usize) -> Result<Vec<Chunk>, Box<dyn std::error::Error>> {
+    let mut all_chunks = Vec::new();
+    let mut chunk_counter = 0;
+
+    // Walk through all files recursively
+    visit_files(root_dir, root_dir, &mut |file_path, relative_path| {
+        // Try to read as UTF-8 text
+        if let Ok(content) = fs::read_to_string(file_path) {
+            // Skip if file is too small or empty
+            if content.trim().is_empty() {
+                return;
+            }
+
+            // Create a stable hash of the file path for consistent chunk IDs
+            let mut hasher = Sha256::new();
+            hasher.update(relative_path.as_bytes());
+            let path_hash = format!("{:x}", hasher.finalize());
+            let short_hash = &path_hash[..8];
+
+            // Split content into chunks
+            let chars: Vec<char> = content.chars().collect();
+            let mut start = 0;
+
+            while start < chars.len() {
+                let end = std::cmp::min(start + chunk_size, chars.len());
+                let chunk_text: String = chars[start..end].iter().collect();
+
+                // Generate stable chunk ID
+                let chunk_id = format!("chunk_{}_{:06}", short_hash, chunk_counter);
+                chunk_counter += 1;
+
+                all_chunks.push(Chunk {
+                    chunk_id,
+                    file_path: relative_path.clone(),
+                    start,
+                    end,
+                    text: chunk_text,
+                });
+
+                start = end;
+            }
+        }
+    })?;
+
+    eprintln!("Extracted {} chunks from repository", all_chunks.len());
+    Ok(all_chunks)
+}
+
+/// Recursively visit all files in a directory
+fn visit_files<F>(
+    path: &Path,
+    root: &Path,
+    callback: &mut F,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: FnMut(&Path, String),
+{
+    if path.is_file() {
+        let relative = path.strip_prefix(root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .to_string();
+        callback(path, relative);
+    } else if path.is_dir() {
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let entry_path = entry.path();
+            let entry_name = entry.file_name().to_string_lossy().to_string();
+
+            // Skip hidden files and directories
+            if entry_name.starts_with('.') {
+                continue;
+            }
+
+            // Skip common binary/build directories
+            if entry_path.is_dir() && matches!(entry_name.as_str(), "target" | "node_modules" | "dist" | "build" | "__pycache__") {
+                continue;
+            }
+
+            visit_files(&entry_path, root, callback)?;
+        }
+    }
+
+    Ok(())
 }

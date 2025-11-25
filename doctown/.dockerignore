@@ -1,0 +1,24 @@
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Model files (too large for Docker build context)
+models/*.onnx
+models/*.bin
+
+# Development files
+.env
+.venv/
+venv/
+*.egg-info/
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
