@@ -551,7 +551,7 @@ class OpenAIDocGenerator:
         api_key: Optional[str] = None,
         model: Optional[str] = None,
         base_url: Optional[str] = None,
-        max_completion_tokens: int = 4096,
+        max_completion_tokens: int = 1024,
         temperature: float = 1.0,
     ):
         """
@@ -562,7 +562,7 @@ class OpenAIDocGenerator:
             model: Model to use (defaults to gpt-5-nano)
             base_url: Custom API base URL (for Azure, proxies, etc.)
             max_completion_tokens: Maximum tokens for each response
-            temperature: Sampling temperature (lower = more deterministic)
+            temperature: Sampling temperature (lower = more deterministic, only 1.0 supported on newer GPT models)
         """
         if not OPENAI_AVAILABLE:
             raise ImportError(
@@ -597,16 +597,26 @@ class OpenAIDocGenerator:
 
         # Initialize rate limiter based on model
         # Rate limits from https://platform.openai.com/account/rate-limits
+        # Using Tier 4 limits (10M TPM) by default - users can override with OPENAI_TPM_LIMIT env var
+        # Tier 1: 500k, Tier 2: 2M, Tier 3: 4M, Tier 4: 10M, Tier 5: 180M
         rate_limits = {
-            "gpt-4o": 30000,           # 30k TPM for tier 1
-            "gpt-4o-mini": 200000,     # 200k TPM for tier 1
-            "gpt-4": 10000,            # 10k TPM for tier 1
-            "gpt-4-turbo": 30000,      # 30k TPM for tier 1
-            "gpt-3.5-turbo": 60000,    # 60k TPM for tier 1
+            "gpt-4o": 10_000_000,       # 10M TPM (Tier 4)
+            "gpt-4o-mini": 10_000_000,  # 10M TPM (Tier 4)
+            "gpt-5-nano": 10_000_000,   # 10M TPM (Tier 4) - assuming similar to gpt-4o
+            "gpt-5-mini": 10_000_000,   # 10M TPM (Tier 4) - assuming similar to gpt-4o-mini
+            "gpt-4": 10_000_000,        # 10M TPM (Tier 4)
+            "gpt-4-turbo": 10_000_000,  # 10M TPM (Tier 4)
+            "gpt-3.5-turbo": 10_000_000, # 10M TPM (Tier 4)
         }
         
-        # Default to conservative 30k TPM if model not recognized
-        tpm_limit = rate_limits.get(self.model, 30000)
+        # Allow override via environment variable (useful for lower tiers)
+        env_tpm_limit = os.getenv("OPENAI_TPM_LIMIT")
+        if env_tpm_limit:
+            tpm_limit = int(env_tpm_limit)
+        else:
+            # Default to Tier 4 limit if model not recognized
+            tpm_limit = rate_limits.get(self.model, 10_000_000)
+        
         self.rate_limiter = TokenBudgetTracker(tokens_per_minute=tpm_limit)
 
         logger.info(f"Initialized OpenAI doc generator with model: {self.model}")
@@ -1204,7 +1214,7 @@ SYMBOLS TO DOCUMENT:
                 # Log truncation stats
                 if truncation_count > 0:
                     async with lock:
-                        logger.debug(f"  Batch {batch_num}: Truncated {truncation_count}/{len(batch)} large symbols to save tokens")
+                        logger.debug(f"  Batch {batch_idx + 1}: Truncated {truncation_count}/{len(batch)} large symbols to save tokens")
                 
                 # Estimate tokens for rate limiting
                 estimated_input_tokens = estimate_tokens(system_prompt + user_content)
@@ -1214,11 +1224,11 @@ SYMBOLS TO DOCUMENT:
                 # Wait for token budget before making request
                 budget_available = await self.rate_limiter.wait_for_budget(
                     estimated_tokens=estimated_total,
-                    max_wait=120.0  # Wait up to 2 minutes for budget
+                    max_wait=10.0  # Wait up to 10 seconds for budget
                 )
                 
                 if not budget_available:
-                    logger.warning(f"Token budget not available after waiting, proceeding anyway for batch {batch_num}")
+                    logger.warning(f"Token budget not available after waiting, proceeding anyway for batch {batch_idx + 1}")
                 
                 # Make API call with structured outputs
                 batch_max_tokens = min(self.max_completion_tokens * len(batch), 16384)
@@ -1246,7 +1256,7 @@ SYMBOLS TO DOCUMENT:
                     
                     # Log token usage for debugging
                     tokens_per_symbol = batch_input_tokens // len(batch) if len(batch) > 0 else 0
-                    logger.debug(f"  Batch {batch_num}: {batch_input_tokens} input tokens "
+                    logger.debug(f"  Batch {batch_idx + 1}: {batch_input_tokens} input tokens "
                                f"({tokens_per_symbol}/symbol), {batch_output_tokens} output, "
                                f"{batch_total_tokens} total")
                     

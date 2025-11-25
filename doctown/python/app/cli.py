@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 import zipfile
 from pathlib import Path
@@ -84,6 +85,9 @@ def cmd_build_llm(args: argparse.Namespace) -> int:
     import asyncio
     from .pipeline import PipelineConfig, DocumentationPipeline
     
+    # Parse max VRAM setting
+    max_memory = {0: args.local_max_vram, "cpu": "30GB"}
+    
     config = PipelineConfig(
         input_source=args.input,
         branch=args.branch,
@@ -93,7 +97,11 @@ def cmd_build_llm(args: argparse.Namespace) -> int:
         embedding_model=args.model,
         embedding_batch_size=args.batch_size,
         use_llm=not args.no_llm,
+        llm_backend=args.llm_backend,
         llm_model=args.llm_model,
+        local_model_id=args.local_model if args.local_model else os.getenv("LOCAL_MODEL", "meta-llama/Llama-3.1-8B-Instruct"),
+        local_quantization=args.local_quantization if args.local_quantization else os.getenv("LOCAL_QUANTIZATION", "4bit"),
+        local_max_memory=max_memory,
         llm_batch_mode=args.llm_batch_mode,
         llm_batch_size=args.llm_batch_size,
         llm_batch_workers=args.llm_batch_workers,
@@ -333,9 +341,31 @@ def main(argv: list[str] | None = None) -> int:
         help="Disable LLM documentation (use rule-based)",
     )
     build_llm_parser.add_argument(
+        "--llm-backend",
+        choices=["openai", "local"],
+        default="local",
+        help="LLM backend: 'openai' for API or 'local' for on-device (default: local)",
+    )
+    build_llm_parser.add_argument(
         "--llm-model",
         default=None,
-        help="OpenAI model to use (default: gpt-4o-mini via env)",
+        help="OpenAI model to use (only for --llm-backend=openai, default: gpt-4o-mini via env)",
+    )
+    build_llm_parser.add_argument(
+        "--local-model",
+        default=None,
+        help="Local model ID (only for --llm-backend=local, default: from LOCAL_MODEL env or meta-llama/Llama-3.1-8B-Instruct)",
+    )
+    build_llm_parser.add_argument(
+        "--local-quantization",
+        choices=["4bit", "8bit", "gptq", "none"],
+        default="4bit",
+        help="Quantization for local model (default: 4bit)",
+    )
+    build_llm_parser.add_argument(
+        "--local-max-vram",
+        default="11GB",
+        help="Max VRAM for local model (e.g., '11GB' for RTX 4070ti Super)",
     )
     build_llm_parser.add_argument(
         "--llm-batch-mode",

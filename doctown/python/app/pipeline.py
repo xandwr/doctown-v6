@@ -38,7 +38,13 @@ from .ingestors import (
     get_registry,
 )
 from .ingestors.base import Domain
-from .llm import OpenAIDocGenerator, create_doc_generator, BatchDocumentationResult
+from .llm import (
+    OpenAIDocGenerator,
+    LocalDocGenerator,
+    create_doc_generator,
+    create_local_generator,
+    BatchDocumentationResult,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -66,15 +72,25 @@ class PipelineConfig:
     embedding_model: str = "fast"
     embedding_batch_size: int = 32
     
-    # Documentation
-    use_llm: bool = True  # Use OpenAI for docs if available
+    # Documentation - LLM Backend Selection
+    use_llm: bool = True  # Enable LLM documentation generation
+    llm_backend: str = "local"  # "openai" or "local" (default: local for on-device)
+    
+    # OpenAI settings (only used when llm_backend="openai")
     llm_model: Optional[str] = None  # Uses OPENAI_MODEL env var if None
+    
+    # Local LLM settings (only used when llm_backend="local")
+    local_model_id: str = os.getenv("LOCAL_MODEL", "meta-llama/Llama-3.1-8B-Instruct")
+    local_quantization: str = os.getenv("LOCAL_QUANTIZATION", "4bit")  # "4bit", "8bit", "gptq", or "none"
+    local_max_memory: dict[int, str] = field(default_factory=lambda: {0: "11GB", "cpu": "30GB"})
+    
+    # Batch mode settings (applies to both backends)
     llm_batch_mode: bool = False  # Use batch mode (multiple symbols per request)
-    llm_batch_size: int = 15  # Symbols per batch request
+    llm_batch_size: int = 50  # Symbols per batch request (increased from 15 for higher TPM limits)
     llm_max_batch_tokens: int = 30000  # Max input tokens per batch
-    llm_batch_workers: int = 3  # Parallel workers for batch mode processing
+    llm_batch_workers: int = 8  # Parallel workers for batch mode processing (increased from 3)
     include_semantic_context: bool = False  # Include semantic relationships in prompts
-    llm_max_concurrent: int = 10  # For per-symbol mode
+    llm_max_concurrent: int = 10  # For per-symbol mode (OpenAI) or 1 (Local)
     llm_max_chunks: Optional[int] = None  # Limit chunks for LLM (cost control)
     llm_semantic_neighbors: int = 3  # Number of semantic neighbors to include as context
     
@@ -589,16 +605,25 @@ class DocumentationPipeline:
         # Fallback to rule-based
         return self._generate_rule_based_docs(chunks)
     
-    def _get_doc_generator(self) -> Optional[OpenAIDocGenerator]:
-        """Get or create the LLM doc generator."""
+    def _get_doc_generator(self):
+        """Get or create the LLM doc generator (OpenAI or Local)."""
         if self._doc_generator is None:
-            self._doc_generator = create_doc_generator(model=self.config.llm_model)
+            if self.config.llm_backend == "local":
+                logger.info(f"Using local LLM: {self.config.local_model_id} ({self.config.local_quantization})")
+                self._doc_generator = create_local_generator(
+                    model_id=self.config.local_model_id,
+                    quantization=self.config.local_quantization,
+                    max_memory=self.config.local_max_memory,
+                )
+            else:
+                logger.info(f"Using OpenAI API: {self.config.llm_model or 'default'}")
+                self._doc_generator = create_doc_generator(model=self.config.llm_model)
         return self._doc_generator
     
     async def _generate_llm_docs(
         self,
         chunks: list[UniversalChunk],
-        generator: OpenAIDocGenerator,
+        generator,  # OpenAIDocGenerator or LocalDocGenerator
         embeddings: Optional[np.ndarray] = None,
     ) -> dict:
         """

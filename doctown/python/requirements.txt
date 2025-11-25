@@ -4,3 +4,11 @@ torch
 openai>=1.0.0
 python-dotenv
 numpy
+
+# Local LLM support
+transformers>=4.36.0
+accelerate>=0.25.0
+bitsandbytes>=0.41.0  # For 4-bit/8-bit quantization
+# Optional: auto-gptq  # For pre-quantized GPTQ models (requires compilation)
+# Optional: flash-attn  # For Flash Attention 2 (faster, requires compilation)
+protobuf
