@@ -10,9 +10,11 @@ import asyncio
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Any, Optional, Literal, Callable
 from concurrent.futures import ThreadPoolExecutor
+from collections import deque
 
 from pydantic import BaseModel, Field
 
@@ -25,6 +27,164 @@ logger = logging.getLogger(__name__)
 def estimate_tokens(text: str) -> int:
     """Rough estimate of token count (1 token ~= 4 chars for English)."""
     return len(text) // 4
+
+
+def truncate_chunk_text(text: str, max_tokens: int = 800) -> tuple[str, bool]:
+    """
+    Intelligently truncate chunk text to fit within token budget.
+    
+    For batch mode, we want to include enough context for the LLM to generate
+    good docs, but not waste tokens on massive function bodies.
+    
+    Strategy:
+    - Keep first ~60% (signature, early logic)
+    - Keep last ~20% (return statements, conclusions)
+    - Add marker for truncated middle
+    
+    Args:
+        text: Full source code text
+        max_tokens: Maximum tokens to allow (default: 800 = ~3200 chars)
+        
+    Returns:
+        Tuple of (truncated_text, was_truncated)
+    """
+    estimated = estimate_tokens(text)
+    if estimated <= max_tokens:
+        return text, False
+    
+    # Calculate character budget (4 chars per token)
+    max_chars = max_tokens * 4
+    
+    # Reserve space for truncation marker
+    marker = "\n... [truncated] ...\n"
+    available_chars = max_chars - len(marker)
+    
+    # Split 70% beginning, 30% ending to preserve signature and conclusion
+    head_chars = int(available_chars * 0.70)
+    tail_chars = int(available_chars * 0.30)
+    
+    head = text[:head_chars].rstrip()
+    tail = text[-tail_chars:].lstrip()
+    
+    truncated = f"{head}{marker}{tail}"
+    return truncated, True
+
+
+class TokenBudgetTracker:
+    """
+    Thread-safe token budget tracker for rate limiting across parallel workers.
+    
+    Tracks token usage within a sliding window to prevent exceeding API rate limits.
+    Automatically expires old usage and provides wait times when budget is exhausted.
+    """
+    
+    def __init__(self, tokens_per_minute: int = 30000, window_seconds: int = 60):
+        """
+        Initialize tracker.
+        
+        Args:
+            tokens_per_minute: Maximum tokens allowed per minute (e.g., 30000 for gpt-4o)
+            window_seconds: Time window for tracking (default: 60 seconds)
+        """
+        self.tokens_per_minute = tokens_per_minute
+        self.window_seconds = window_seconds
+        self.lock = asyncio.Lock()
+        # Store (timestamp, token_count) tuples
+        self.usage_history: deque = deque()
+        self.total_tokens_used = 0
+        self.total_requests = 0
+        
+    async def _cleanup_old_entries(self):
+        """Remove entries older than the window."""
+        now = time.time()
+        cutoff = now - self.window_seconds
+        
+        while self.usage_history and self.usage_history[0][0] < cutoff:
+            self.usage_history.popleft()
+    
+    async def get_current_usage(self) -> int:
+        """Get current token usage within the window."""
+        async with self.lock:
+            await self._cleanup_old_entries()
+            return sum(tokens for _, tokens in self.usage_history)
+    
+    async def get_available_budget(self) -> int:
+        """Get remaining tokens available in current window."""
+        current = await self.get_current_usage()
+        return max(0, self.tokens_per_minute - current)
+    
+    async def can_send_request(self, estimated_tokens: int) -> tuple[bool, float]:
+        """
+        Check if request can be sent without exceeding budget.
+        
+        Args:
+            estimated_tokens: Estimated tokens for the request
+            
+        Returns:
+            (can_send, wait_seconds) - If False, wait_seconds indicates how long to wait
+        """
+        async with self.lock:
+            await self._cleanup_old_entries()
+            current_usage = sum(tokens for _, tokens in self.usage_history)
+            
+            if current_usage + estimated_tokens <= self.tokens_per_minute:
+                return True, 0.0
+            
+            # Calculate wait time: find when oldest entry expires
+            if self.usage_history:
+                oldest_timestamp = self.usage_history[0][0]
+                wait_time = max(0.1, (oldest_timestamp + self.window_seconds) - time.time())
+                return False, wait_time
+            
+            return True, 0.0
+    
+    async def record_usage(self, tokens: int):
+        """Record token usage for a request."""
+        async with self.lock:
+            now = time.time()
+            self.usage_history.append((now, tokens))
+            self.total_tokens_used += tokens
+            self.total_requests += 1
+            await self._cleanup_old_entries()
+    
+    async def wait_for_budget(self, estimated_tokens: int, max_wait: float = 60.0) -> bool:
+        """
+        Wait until budget is available for the request.
+        
+        Args:
+            estimated_tokens: Estimated tokens needed
+            max_wait: Maximum seconds to wait (default: 60)
+            
+        Returns:
+            True if budget became available, False if max_wait exceeded
+        """
+        start_time = time.time()
+        
+        while True:
+            can_send, wait_time = await self.can_send_request(estimated_tokens)
+            
+            if can_send:
+                return True
+            
+            elapsed = time.time() - start_time
+            if elapsed >= max_wait:
+                logger.warning(f"Max wait time {max_wait}s exceeded waiting for token budget")
+                return False
+            
+            # Wait for the calculated time, but check max_wait
+            actual_wait = min(wait_time, max_wait - elapsed)
+            if actual_wait > 0:
+                logger.info(f"Rate limit: waiting {actual_wait:.1f}s for token budget (current: {await self.get_current_usage()}/{self.tokens_per_minute})")
+                await asyncio.sleep(actual_wait)
+    
+    def get_stats(self) -> dict:
+        """Get statistics about token usage."""
+        return {
+            "total_tokens_used": self.total_tokens_used,
+            "total_requests": self.total_requests,
+            "tokens_per_minute_limit": self.tokens_per_minute,
+            "window_seconds": self.window_seconds,
+        }
 
 # Try to import openai
 try:
@@ -383,8 +543,8 @@ class OpenAIDocGenerator:
         results = generator.generate_batch(chunks)
     """
     
-    # Default model - gpt-5-nano is the smallest/fastest modern model
-    DEFAULT_MODEL = "gpt-5-nano"
+    # Default model - gpt-4o-mini offers good balance of cost, speed, and quality
+    DEFAULT_MODEL = "gpt-4o-mini"
     
     def __init__(
         self,
@@ -435,7 +595,22 @@ class OpenAIDocGenerator:
         self._client = OpenAI(api_key=self.api_key, base_url=self.base_url if self.base_url else None)
         self._async_client = AsyncOpenAI(api_key=self.api_key, base_url=self.base_url if self.base_url else None)
 
+        # Initialize rate limiter based on model
+        # Rate limits from https://platform.openai.com/account/rate-limits
+        rate_limits = {
+            "gpt-4o": 30000,           # 30k TPM for tier 1
+            "gpt-4o-mini": 200000,     # 200k TPM for tier 1
+            "gpt-4": 10000,            # 10k TPM for tier 1
+            "gpt-4-turbo": 30000,      # 30k TPM for tier 1
+            "gpt-3.5-turbo": 60000,    # 60k TPM for tier 1
+        }
+        
+        # Default to conservative 30k TPM if model not recognized
+        tpm_limit = rate_limits.get(self.model, 30000)
+        self.rate_limiter = TokenBudgetTracker(tokens_per_minute=tpm_limit)
+
         logger.info(f"Initialized OpenAI doc generator with model: {self.model}")
+        logger.info(f"Rate limiter: {tpm_limit:,} tokens per minute")
     
     def generate_for_chunk(
         self,
@@ -838,14 +1013,14 @@ class OpenAIDocGenerator:
         num_batches = (len(chunks) + batch_size - 1) // batch_size
         
         # Estimate tokens per batch request
-        # Each symbol: ~500 tokens content + ~150 tokens prompt overhead
-        # Plus shared system prompt: ~200 tokens
+        # Each symbol: ~400 tokens content (truncated) + ~100 tokens formatting/context
+        # Plus shared system prompt: ~400 tokens (with batch instructions)
         # Plus structured output overhead: ~50 tokens per symbol
-        tokens_per_symbol = 500
-        prompt_overhead = 200
-        structured_overhead = 50
+        tokens_per_symbol = 400  # Matches truncation limit
+        prompt_overhead = 400  # System prompt + batch instructions
+        per_symbol_overhead = 150  # Formatting + context + structured overhead
         
-        avg_input_per_batch = prompt_overhead + (batch_size * (tokens_per_symbol + structured_overhead))
+        avg_input_per_batch = prompt_overhead + (batch_size * (tokens_per_symbol + per_symbol_overhead))
         avg_output_per_batch = batch_size * 400  # ~400 tokens per symbol output
         
         total_input = num_batches * avg_input_per_batch
@@ -984,14 +1159,22 @@ Your response will be automatically validated. Missing or mismatched symbol_ids 
                 
                 # Build user prompt with symbol details as structured data
                 symbols_data = []
+                truncation_count = 0
                 for chunk in batch:
                     context = context_map.get(chunk.chunk_id, "")
+                    
+                    # Truncate large chunks to save tokens (max 400 tokens = ~1600 chars per symbol)
+                    # This keeps batch sizes manageable while preserving key info
+                    truncated_text, was_truncated = truncate_chunk_text(chunk.text, max_tokens=400)
+                    if was_truncated:
+                        truncation_count += 1
+                    
                     symbol_info = {
                         "symbol_id": chunk.chunk_id,
                         "path": chunk.path,
                         "type": chunk.type.value if hasattr(chunk.type, 'value') else str(chunk.type),
                         "language": chunk.metadata.language or "",
-                        "text": chunk.text,
+                        "text": truncated_text,
                     }
                     if context:
                         symbol_info["context"] = context
@@ -1018,6 +1201,25 @@ SYMBOLS TO DOCUMENT:
                 user_content += f"REQUIRED: Document ALL {len(batch)} symbols above in the structured JSON format.\n"
                 user_content += f"Symbol IDs to include: {[s['symbol_id'] for s in symbols_data]}\n"
                 
+                # Log truncation stats
+                if truncation_count > 0:
+                    async with lock:
+                        logger.debug(f"  Batch {batch_num}: Truncated {truncation_count}/{len(batch)} large symbols to save tokens")
+                
+                # Estimate tokens for rate limiting
+                estimated_input_tokens = estimate_tokens(system_prompt + user_content)
+                estimated_output_tokens = len(batch) * 200  # Conservative estimate per symbol
+                estimated_total = estimated_input_tokens + estimated_output_tokens
+                
+                # Wait for token budget before making request
+                budget_available = await self.rate_limiter.wait_for_budget(
+                    estimated_tokens=estimated_total,
+                    max_wait=120.0  # Wait up to 2 minutes for budget
+                )
+                
+                if not budget_available:
+                    logger.warning(f"Token budget not available after waiting, proceeding anyway for batch {batch_num}")
+                
                 # Make API call with structured outputs
                 batch_max_tokens = min(self.max_completion_tokens * len(batch), 16384)
                 
@@ -1041,6 +1243,15 @@ SYMBOLS TO DOCUMENT:
                     batch_output_tokens = response.usage.completion_tokens
                     batch_cached_tokens = getattr(response.usage.prompt_tokens_details, 'cached_tokens', 0) if hasattr(response.usage, 'prompt_tokens_details') else 0
                     batch_total_tokens = response.usage.total_tokens
+                    
+                    # Log token usage for debugging
+                    tokens_per_symbol = batch_input_tokens // len(batch) if len(batch) > 0 else 0
+                    logger.debug(f"  Batch {batch_num}: {batch_input_tokens} input tokens "
+                               f"({tokens_per_symbol}/symbol), {batch_output_tokens} output, "
+                               f"{batch_total_tokens} total")
+                    
+                    # Record actual token usage for rate limiting
+                    await self.rate_limiter.record_usage(batch_total_tokens)
                 else:
                     batch_input_tokens = 0
                     batch_output_tokens = 0
@@ -1209,6 +1420,12 @@ SYMBOLS TO DOCUMENT:
         # Final display update
         async with lock:
             update_worker_display()
+        
+        # Log rate limiter statistics
+        rate_stats = self.rate_limiter.get_stats()
+        logger.info(f"Rate limiter stats: {rate_stats['total_requests']} requests, "
+                   f"{rate_stats['total_tokens_used']:,} tokens used, "
+                   f"{rate_stats['tokens_per_minute_limit']:,} TPM limit")
         
         # Calculate total cost
         batch_result.calculate_cost()

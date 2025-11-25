@@ -29,6 +29,7 @@ from typing import Any, Optional, Callable
 import numpy as np
 
 from .binary_io import tensor_to_numpy, write_embeddings_bin
+from .doc_scorer import DocScorer
 from .embedder import EmbeddingModel
 from .ingestors import (
     DomainIngestor,
@@ -71,7 +72,7 @@ class PipelineConfig:
     llm_batch_mode: bool = False  # Use batch mode (multiple symbols per request)
     llm_batch_size: int = 15  # Symbols per batch request
     llm_max_batch_tokens: int = 30000  # Max input tokens per batch
-    llm_batch_workers: int = 8  # Parallel workers for batch mode processing
+    llm_batch_workers: int = 3  # Parallel workers for batch mode processing
     include_semantic_context: bool = False  # Include semantic relationships in prompts
     llm_max_concurrent: int = 10  # For per-symbol mode
     llm_max_chunks: Optional[int] = None  # Limit chunks for LLM (cost control)
@@ -80,6 +81,13 @@ class PipelineConfig:
     # Graph
     similarity_threshold: float = 0.7
     max_edges_per_node: int = 5
+    
+    # DocScore filtering
+    use_doc_scorer: bool = True  # Enable multi-signal doc-worthiness scoring
+    doc_score_threshold: float = 0.65  # Minimum score for LLM documentation
+    doc_score_structural_weight: float = 0.50  # AST importance weight
+    doc_score_semantic_weight: float = 0.35  # Embedding prominence weight
+    doc_score_complexity_weight: float = 0.15  # Size/complexity weight
     
     # Rust binary (for code ingestor)
     rust_binary: Optional[Path] = None
@@ -173,6 +181,11 @@ class DocumentationPipeline:
             logger.info("Step 5/7: Building semantic graph...")
             graph = self._build_graph(chunks, embeddings_meta["embeddings_array"])
             
+            # Step 5.5: Score chunks for doc-worthiness (if enabled)
+            if self.config.use_doc_scorer:
+                logger.info("Step 5.5/7: Computing DocScores...")
+                chunks = self._score_chunks(chunks, embeddings_meta["embeddings_array"], graph)
+            
             # Step 6: Generate documentation
             logger.info("Step 6/7: Generating documentation...")
             docs = await self._generate_documentation(
@@ -190,17 +203,29 @@ class DocumentationPipeline:
             
             logger.info(f"✅ Pipeline complete: {docpack_path}")
             
+            # Compute final stats
+            stats = {
+                "domain": ingestor.domain.value,
+                "total_files": len(files),
+                "total_chunks": len(chunks),
+                "embedding_dims": embeddings_meta["n_dims"],
+                "llm_docs_generated": docs.get("generation_stats", {}).get("successful", 0),
+            }
+            
+            # Add DocScore stats if enabled
+            if self.config.use_doc_scorer:
+                doc_worthy_count = sum(
+                    1 for c in chunks
+                    if c.metadata.extra.get("doc_worthy", False)
+                )
+                stats["doc_worthy_chunks"] = doc_worthy_count
+                stats["doc_worthy_percent"] = round(100 * doc_worthy_count / len(chunks), 1)
+            
             return PipelineResult(
                 success=True,
                 docpack_path=docpack_path,
                 manifest=manifest,
-                stats={
-                    "domain": ingestor.domain.value,
-                    "total_files": len(files),
-                    "total_chunks": len(chunks),
-                    "embedding_dims": embeddings_meta["n_dims"],
-                    "llm_docs_generated": docs.get("generation_stats", {}).get("successful", 0),
-                },
+                stats=stats,
             )
             
         except Exception as e:
@@ -431,6 +456,39 @@ class DocumentationPipeline:
         
         return neighbors_map
     
+    def _score_chunks(
+        self,
+        chunks: list[UniversalChunk],
+        embeddings: np.ndarray,
+        graph: dict,
+    ) -> list[UniversalChunk]:
+        """
+        Score chunks for doc-worthiness using multi-signal DocScore.
+        
+        Combines structural, semantic, and complexity signals to determine
+        which chunks are worth documenting with LLM.
+        """
+        scorer = DocScorer(
+            structural_weight=self.config.doc_score_structural_weight,
+            semantic_weight=self.config.doc_score_semantic_weight,
+            complexity_weight=self.config.doc_score_complexity_weight,
+            doc_threshold=self.config.doc_score_threshold,
+        )
+        
+        # Score all chunks
+        scored_chunks = scorer.score_chunks(chunks, embeddings, graph)
+        
+        # Log statistics
+        stats = scorer.get_score_statistics(scored_chunks)
+        if stats:
+            logger.info(f"  DocScore statistics:")
+            logger.info(f"    Mean: {stats['mean']:.3f}, Median: {stats['median']:.3f}")
+            logger.info(f"    Range: [{stats['min']:.3f}, {stats['max']:.3f}]")
+            logger.info(f"    Doc-worthy: {stats['doc_worthy']}/{stats['count']} "
+                       f"({stats['doc_worthy_percent']:.1f}%)")
+        
+        return scored_chunks
+    
     def _build_graph(
         self,
         chunks: list[UniversalChunk],
@@ -551,30 +609,59 @@ class DocumentationPipeline:
         2. Batch mode: Multiple symbols per request for better latency and context utilization
         
         When embeddings are provided, enriches context with semantic neighbors.
+        When DocScorer is enabled, filters to only doc-worthy chunks.
         """
         from .llm.openai_client import estimate_tokens
         
-        # Optionally limit chunks for cost control
-        if self.config.llm_max_chunks and len(chunks) > self.config.llm_max_chunks:
-            logger.info(f"  Limiting LLM docs to {self.config.llm_max_chunks} symbols (have {len(chunks)})")
-            # Prioritize first chunk of each file
-            seen_paths = set()
-            priority_chunks = []
-            other_chunks = []
-            
-            for chunk in chunks:
-                if chunk.path not in seen_paths:
-                    priority_chunks.append(chunk)
-                    seen_paths.add(chunk.path)
-                else:
-                    other_chunks.append(chunk)
-            
-            chunks_to_document = priority_chunks[:self.config.llm_max_chunks]
-            remaining = self.config.llm_max_chunks - len(chunks_to_document)
-            if remaining > 0:
-                chunks_to_document.extend(other_chunks[:remaining])
+        # Filter by DocScore if enabled
+        if self.config.use_doc_scorer:
+            doc_worthy_chunks = [
+                c for c in chunks
+                if c.metadata.extra.get("doc_worthy", False)
+            ]
+            if doc_worthy_chunks:
+                logger.info(
+                    f"  DocScore filtering: {len(doc_worthy_chunks)}/{len(chunks)} chunks "
+                    f"are doc-worthy (threshold={self.config.doc_score_threshold})"
+                )
+                chunks_to_process = doc_worthy_chunks
+            else:
+                logger.warning("  No chunks passed DocScore threshold, documenting all chunks")
+                chunks_to_process = chunks
         else:
-            chunks_to_document = chunks
+            chunks_to_process = chunks
+        
+        # Optionally limit chunks for cost control
+        if self.config.llm_max_chunks and len(chunks_to_process) > self.config.llm_max_chunks:
+            logger.info(f"  Limiting LLM docs to {self.config.llm_max_chunks} symbols (have {len(chunks_to_process)})")
+            # Prioritize by DocScore if available, otherwise first chunk of each file
+            if self.config.use_doc_scorer:
+                # Sort by doc_score descending
+                sorted_chunks = sorted(
+                    chunks_to_process,
+                    key=lambda c: c.metadata.extra.get("doc_score", 0.0),
+                    reverse=True
+                )
+                chunks_to_document = sorted_chunks[:self.config.llm_max_chunks]
+            else:
+                # Prioritize first chunk of each file
+                seen_paths = set()
+                priority_chunks = []
+                other_chunks = []
+                
+                for chunk in chunks_to_process:
+                    if chunk.path not in seen_paths:
+                        priority_chunks.append(chunk)
+                        seen_paths.add(chunk.path)
+                    else:
+                        other_chunks.append(chunk)
+                
+                chunks_to_document = priority_chunks[:self.config.llm_max_chunks]
+                remaining = self.config.llm_max_chunks - len(chunks_to_document)
+                if remaining > 0:
+                    chunks_to_document.extend(other_chunks[:remaining])
+        else:
+            chunks_to_document = chunks_to_process
         
         # Compute semantic neighbors if embeddings available
         semantic_neighbors_map = {}
@@ -586,22 +673,23 @@ class DocumentationPipeline:
                 k=self.config.llm_semantic_neighbors,
             )
         
-        # Build context map with semantic information
+        # Build context map with semantic information (keep it MINIMAL to save tokens)
         context_map = {}
         chunk_by_id = {c.chunk_id: c for c in chunks_to_document}
         
         for chunk in chunks_to_document:
             context_parts = []
             
-            # Add semantic neighbors
+            # Add semantic neighbors (very brief to minimize token usage)
             neighbors = semantic_neighbors_map.get(chunk.chunk_id, [])
             if neighbors:
-                context_parts.append("**Semantically Related:**")
+                context_parts.append("**Related:**")
                 for neighbor_id, score in neighbors[:self.config.llm_semantic_neighbors]:
                     neighbor = chunk_by_id.get(neighbor_id)
                     if neighbor:
-                        preview = neighbor.text[:100].replace('\n', ' ')
-                        context_parts.append(f"- {neighbor.path} (similarity: {score:.2f}): {preview}...")
+                        # Just show path and type, no text preview (saves tokens!)
+                        neighbor_type = neighbor.type.value if hasattr(neighbor.type, 'value') else str(neighbor.type)
+                        context_parts.append(f"- {neighbor.path} ({neighbor_type})")
             
             if context_parts:
                 context_map[chunk.chunk_id] = "\n".join(context_parts)
@@ -739,7 +827,7 @@ class DocumentationPipeline:
         ingestor: DomainIngestor,
     ) -> dict:
         """Create the manifest.json content."""
-        return {
+        manifest = {
             "docpack_version": DOCPACK_VERSION,
             "source": source_info,
             "domain": ingestor.domain.value,
@@ -755,6 +843,32 @@ class DocumentationPipeline:
                 "gpu_used": embeddings_meta.get("model_info", {}).get("device", "").startswith("cuda"),
             },
         }
+        
+        # Add DocScore statistics if enabled
+        if self.config.use_doc_scorer:
+            doc_worthy_count = sum(
+                1 for c in chunks
+                if c.metadata.extra.get("doc_worthy", False)
+            )
+            scores = [c.metadata.extra.get("doc_score", 0.0) for c in chunks]
+            if scores:
+                manifest["doc_scoring"] = {
+                    "enabled": True,
+                    "threshold": self.config.doc_score_threshold,
+                    "weights": {
+                        "structural": self.config.doc_score_structural_weight,
+                        "semantic": self.config.doc_score_semantic_weight,
+                        "complexity": self.config.doc_score_complexity_weight,
+                    },
+                    "statistics": {
+                        "doc_worthy_chunks": doc_worthy_count,
+                        "doc_worthy_percent": round(100 * doc_worthy_count / len(chunks), 2),
+                        "mean_score": round(float(np.mean(scores)), 4),
+                        "median_score": round(float(np.median(scores)), 4),
+                    },
+                }
+        
+        return manifest
     
     def _generate_readme(self, manifest: dict) -> str:
         """Generate README.md content."""

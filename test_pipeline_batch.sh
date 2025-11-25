@@ -6,12 +6,13 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Default batch mode settings optimized for gpt-4o rate limits
-# gpt-4o has 30K TPM (tokens per minute) limit
-# We use 25K to leave headroom for response tokens
+# Default batch mode settings optimized for rate limits with smart throttling
+# gpt-4o-mini: 200K TPM (tokens per minute) - default model
+# gpt-4o: 30K TPM - specify with --model gpt-4o
+# Built-in rate limiter prevents exceeding limits automatically
 BATCH_SIZE=15              # Process 15 symbols at once
-MAX_BATCH_TOKENS=25000     # Stay under 30K TPM limit
-BATCH_WORKERS=8            # Parallel workers for maximum throughput
+MAX_BATCH_TOKENS=25000     # Max tokens per batch request
+BATCH_WORKERS=3            # Parallel workers (reduced for rate limit safety)
 INCLUDE_SEMANTIC=true      # Include semantic context from embeddings
 
 log() { printf "%s %s\n" "$(date --iso-8601=seconds)" "$*"; }

@@ -103,6 +103,11 @@ def cmd_build_llm(args: argparse.Namespace) -> int:
         llm_max_chunks=args.llm_max_chunks,
         llm_semantic_neighbors=args.llm_semantic_neighbors,
         ingestor_name=args.ingestor,
+        use_doc_scorer=not args.no_doc_scorer,
+        doc_score_threshold=args.doc_score_threshold,
+        doc_score_structural_weight=args.doc_score_structural,
+        doc_score_semantic_weight=args.doc_score_semantic,
+        doc_score_complexity_weight=args.doc_score_complexity,
     )
     
     logger.info(f"Building docpack from: {args.input}")
@@ -121,6 +126,9 @@ def cmd_build_llm(args: argparse.Namespace) -> int:
         print(f"   Embedding dims: {result.stats.get('embedding_dims', 'N/A')}")
         if result.stats.get('llm_docs_generated'):
             print(f"   LLM docs: {result.stats.get('llm_docs_generated', 0)} generated")
+        if result.stats.get('doc_worthy_chunks'):
+            print(f"   DocScore: {result.stats.get('doc_worthy_chunks', 0)} doc-worthy chunks "
+                  f"({result.stats.get('doc_worthy_percent', 0):.1f}%)")
         return 0
     else:
         print(f"\n❌ Pipeline failed!")
@@ -327,7 +335,7 @@ def main(argv: list[str] | None = None) -> int:
     build_llm_parser.add_argument(
         "--llm-model",
         default=None,
-        help="OpenAI model to use (default: gpt-5-nano via env)",
+        help="OpenAI model to use (default: gpt-4o-mini via env)",
     )
     build_llm_parser.add_argument(
         "--llm-batch-mode",
@@ -343,8 +351,8 @@ def main(argv: list[str] | None = None) -> int:
     build_llm_parser.add_argument(
         "--llm-batch-workers",
         type=int,
-        default=8,
-        help="Parallel workers for batch mode processing (default: 8)",
+        default=3,
+        help="Parallel workers for batch mode processing (default: 3)",
     )
     build_llm_parser.add_argument(
         "--llm-concurrent",
@@ -374,6 +382,35 @@ def main(argv: list[str] | None = None) -> int:
         "--include-semantic-context",
         action="store_true",
         help="Include semantic relationships from embeddings in LLM prompts",
+    )
+    build_llm_parser.add_argument(
+        "--doc-score-threshold",
+        type=float,
+        default=0.65,
+        help="Minimum DocScore for LLM documentation (0.0-1.0, default: 0.65)",
+    )
+    build_llm_parser.add_argument(
+        "--no-doc-scorer",
+        action="store_true",
+        help="Disable DocScore filtering (document all chunks)",
+    )
+    build_llm_parser.add_argument(
+        "--doc-score-structural",
+        type=float,
+        default=0.50,
+        help="Structural signal weight in DocScore (default: 0.50)",
+    )
+    build_llm_parser.add_argument(
+        "--doc-score-semantic",
+        type=float,
+        default=0.35,
+        help="Semantic signal weight in DocScore (default: 0.35)",
+    )
+    build_llm_parser.add_argument(
+        "--doc-score-complexity",
+        type=float,
+        default=0.15,
+        help="Complexity signal weight in DocScore (default: 0.15)",
     )
     build_llm_parser.add_argument(
         "--ingestor",
